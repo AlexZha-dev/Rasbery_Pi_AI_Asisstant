@@ -1,0 +1,28 @@
+repos:
+  # Автоформатирование кода
+  - repo: https://github.com/psf/black
+    rev: 25.9.0
+    hooks:
+      - id: black
+        language_version: python3.11
+
+  # Проверка линтером flake8
+  - repo: https://github.com/PyCQA/flake8
+    rev: 7.3.0
+    hooks:
+      - id: flake8
+
+  # Сортировка импортов
+  - repo: https://github.com/pre-commit/mirrors-isort
+    rev: v5.10.1
+    hooks:
+      - id: isort
+
+  # Запуск тестов через pytest
+  - repo: local
+    hooks:
+      - id: pytest
+        name: Run pytest
+        entry: pytest -q --tb=short
+        language: system
+        types: [python]
