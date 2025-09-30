@@ -14,10 +14,6 @@ jobs:
   lint-format-test:
     runs-on: ubuntu-latest
 
-    strategy:
-      matrix:
-        python-version: [3.10, 3.11, 3.12]
-
     steps:
       - name: Checkout code
         uses: actions/checkout@v3
@@ -44,14 +40,14 @@ jobs:
 
       - name: Run linters
         run: |
-          flake8 .
-          isort --check-only .
-          black --check .
+          flake8 src/
+          isort --check-only src/
+          black --check src/
 
       - name: Autoformat code
         run: |
-          isort .
-          black .
+          isort src/
+          black src/
 
       - name: Run tests
         run: |
