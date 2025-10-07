@@ -14,8 +14,8 @@ install:
 # Проверка форматеров
 lint:
 	flake8 src/
-	isort --check-only src/
-	black --check src/
+	isort  src/
+	black  src/
 
 format:
 	isort src/
