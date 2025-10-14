@@ -1,4 +1,5 @@
 import time
+
 import sounddevice as sd
 
 from exceptions.audio_exceptions import AudioError
