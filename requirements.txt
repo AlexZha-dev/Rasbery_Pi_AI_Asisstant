@@ -5,6 +5,7 @@ cfgv==3.4.0
 click==8.3.0
 colorzero==2.0
 distlib==0.4.0
+dotenv==0.9.9
 filelock==3.19.1
 flake8==7.3.0
 gpiozero==2.0.1
@@ -26,9 +27,12 @@ pyflakes==3.4.0
 Pygments==2.19.2
 pytest==8.4.2
 pytest-asyncio==1.2.0
+python-dotenv==1.1.1
 pytokens==0.1.10
 PyYAML==6.0.3
 setuptools==80.9.0
 sounddevice==0.5.2
+soundfile==0.13.1
 typing_extensions==4.15.0
 virtualenv==20.34.0
+websockets==15.0.1
