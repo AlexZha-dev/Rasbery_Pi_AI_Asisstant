@@ -5,12 +5,13 @@
 """
 
 import asyncio
-import json
 import base64
+import json
 import os
+
 import numpy as np
-import websockets
 import soundfile as sf
+import websockets
 
 # Сессии: session_id -> список numpy фреймов
 sessions = {}
@@ -21,7 +22,7 @@ os.makedirs(OUTPUT_DIR, exist_ok=True)
 
 
 async def handle_client(ws):
-    print(f"[SERVER] New connection")
+    print("[SERVER] New connection")
     try:
         async for message in ws:
             try:
@@ -37,7 +38,9 @@ async def handle_client(ws):
                 try:
                     dtype = data["dtype"]
                     shape = tuple(data["shape"])
-                    arr = np.frombuffer(base64.b64decode(data["data_b64"]), dtype=dtype).reshape(shape)
+                    arr = np.frombuffer(
+                        base64.b64decode(data["data_b64"]), dtype=dtype
+                    ).reshape(shape)
                 except Exception as e:
                     print(f"[SERVER] Failed to decode frame: {e}")
                     continue
@@ -47,13 +50,17 @@ async def handle_client(ws):
                 sessions[session_id].append(arr)
 
                 # Эхо фрейм обратно
-                await ws.send(json.dumps({
-                    "type": "audio_chunk",
-                    "session_id": session_id,
-                    "data_b64": data["data_b64"],
-                    "dtype": dtype,
-                    "shape": shape
-                }))
+                await ws.send(
+                    json.dumps(
+                        {
+                            "type": "audio_chunk",
+                            "session_id": session_id,
+                            "data_b64": data["data_b64"],
+                            "dtype": dtype,
+                            "shape": shape,
+                        }
+                    )
+                )
                 print(f"[SERVER] Received and echoed frame, session {session_id}")
 
             elif msg_type == "end_session":
@@ -71,22 +78,25 @@ async def handle_client(ws):
                     # Отправляем файл обратно клиенту по блокам
                     blocksize = 1024
                     for start in range(0, combined.shape[0], blocksize):
-                        block = combined[start:start + blocksize]
+                        block = combined[start : start + blocksize]
                         block_b64 = base64.b64encode(block.tobytes()).decode("ascii")
-                        await ws.send(json.dumps({
-                            "type": "audio_chunk",
-                            "session_id": session_id,
-                            "data_b64": block_b64,
-                            "dtype": str(block.dtype),
-                            "shape": block.shape
-                        }))
+                        await ws.send(
+                            json.dumps(
+                                {
+                                    "type": "audio_chunk",
+                                    "session_id": session_id,
+                                    "data_b64": block_b64,
+                                    "dtype": str(block.dtype),
+                                    "shape": block.shape,
+                                }
+                            )
+                        )
                     print(f"[SERVER] Sent WAV back as frames for session {session_id}")
 
                 # Сигнал завершения
-                await ws.send(json.dumps({
-                    "type": "end_session",
-                    "session_id": session_id
-                }))
+                await ws.send(
+                    json.dumps({"type": "end_session", "session_id": session_id})
+                )
 
                 if session_id in sessions:
                     del sessions[session_id]

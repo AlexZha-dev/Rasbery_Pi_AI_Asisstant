@@ -1,12 +1,19 @@
 import asyncio
-import websockets
 from typing import Callable, Optional
+
+import numpy as np
+import websockets
+
 from config.audio_config import AUDIO_WS_URL
 from dto.audio_message import AudioMessage
-import numpy as np
+
 
 class AudioWebSocketClient:
-    def __init__(self, url: Optional[str] = None, on_receive: Optional[Callable[[AudioMessage], None]] = None):
+    def __init__(
+        self,
+        url: Optional[str] = None,
+        on_receive: Optional[Callable[[AudioMessage], None]] = None,
+    ):
         self.url = url or AUDIO_WS_URL
         self._ws = None
         self._on_receive = on_receive
@@ -36,12 +43,13 @@ class AudioWebSocketClient:
     async def send_audio_chunk(self, session_id: str, frame: np.ndarray):
         await self._connected.wait()
         from dto.audio_message import np_to_base64
+
         msg = AudioMessage(
             type="audio_chunk",
             session_id=session_id,
             data_b64=np_to_base64(frame),
             dtype=str(frame.dtype),
-            shape=frame.shape
+            shape=frame.shape,
         )
         await self._ws.send(msg.to_json())
 

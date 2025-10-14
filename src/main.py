@@ -1,9 +1,11 @@
 import asyncio
-from infrastructure.websocket_client import AudioWebSocketClient
+
 from application.audio_session import AudioSession
-from infrastructure.sounds_adapters import MicrophoneAsyncAdapter, SpeakerAsyncAdapter
 from infrastructure.microphone_interface import MicrophoneInterface
+from infrastructure.sounds_adapters import MicrophoneAsyncAdapter, SpeakerAsyncAdapter
 from infrastructure.speaker_interface import SpeakerInterface
+from infrastructure.websocket_client import AudioWebSocketClient
+
 
 async def main():
     mic = MicrophoneInterface(samplerate=16000, channels=1, blocksize=1024)
@@ -17,6 +19,7 @@ async def main():
     await session.run_once(timeout=5)
 
     await ws_client.close()
+
 
 if __name__ == "__main__":
     asyncio.run(main())

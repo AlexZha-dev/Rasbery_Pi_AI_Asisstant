@@ -1,7 +1,9 @@
 import asyncio
 import uuid
+
 from dto.audio_message import base64_to_np
 from infrastructure.websocket_client import AudioWebSocketClient
+
 
 class AudioSession:
     def __init__(self, ws: AudioWebSocketClient, mic_adapter, spk_adapter):

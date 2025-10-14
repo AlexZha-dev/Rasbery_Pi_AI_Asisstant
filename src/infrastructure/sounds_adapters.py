@@ -1,8 +1,11 @@
 import asyncio
+
 import numpy as np
+
 
 class MicrophoneAsyncAdapter:
     """Адаптер для потокового микрофона, чтобы читать данные асинхронно."""
+
     def __init__(self, microphone):
         self.mic = microphone
 
@@ -17,6 +20,7 @@ class MicrophoneAsyncAdapter:
 
 class SpeakerAsyncAdapter:
     """Адаптер для потокового спикера, чтобы безопасно вызывать play() из async."""
+
     def __init__(self, speaker):
         self.spk = speaker
 

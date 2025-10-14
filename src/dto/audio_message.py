@@ -2,6 +2,7 @@ import base64
 import json
 from dataclasses import dataclass
 from typing import Optional, Tuple
+
 import numpy as np
 
 
@@ -26,7 +27,13 @@ class AudioMessage:
     def to_json(self) -> str:
         data = {"type": self.type, "session_id": self.session_id}
         if self.data_b64 is not None:
-            data.update({"data_b64": self.data_b64, "dtype": self.dtype, "shape": list(self.shape)})
+            data.update(
+                {
+                    "data_b64": self.data_b64,
+                    "dtype": self.dtype,
+                    "shape": list(self.shape),
+                }
+            )
         if self.extra:
             data["extra"] = self.extra
         return json.dumps(data)

@@ -1,6 +1,6 @@
+import asyncio
 import queue
 import threading
-import asyncio
 import time
 from typing import Optional
 
@@ -40,7 +40,9 @@ class SpeakerInterface:
             self._initial_output_device = defaults
 
         self._device = self._initial_output_device
-        self._play_queue: "queue.Queue[np.ndarray]" = queue.Queue(maxsize=max_queue_blocks)
+        self._play_queue: "queue.Queue[np.ndarray]" = queue.Queue(
+            maxsize=max_queue_blocks
+        )
 
         self._stream: Optional[sd.OutputStream] = None
         self._thread: Optional[threading.Thread] = None
@@ -67,7 +69,9 @@ class SpeakerInterface:
             if arr.shape[0] > self.blocksize:
                 arr = arr[: self.blocksize, ...]
             else:
-                pad = np.zeros((self.blocksize - arr.shape[0], arr.shape[1]), dtype=self.dtype)
+                pad = np.zeros(
+                    (self.blocksize - arr.shape[0], arr.shape[1]), dtype=self.dtype
+                )
                 arr = np.concatenate([arr, pad], axis=0)
         # Блокирующий put в очереди (не дропаем)
         self._play_queue.put(arr, block=True)
@@ -78,14 +82,19 @@ class SpeakerInterface:
             if item.shape[0] >= frames:
                 out_chunk = item[:frames]
             else:
-                pad = np.zeros((frames - item.shape[0], item.shape[1]), dtype=self.dtype)
+                pad = np.zeros(
+                    (frames - item.shape[0], item.shape[1]), dtype=self.dtype
+                )
                 out_chunk = np.concatenate([item, pad], axis=0)
         except queue.Empty:
             out_chunk = np.zeros((frames, self.channels), dtype=self.dtype)
 
         if out_chunk.shape[1] != self.channels:
             if out_chunk.shape[1] < self.channels:
-                pad = np.zeros((out_chunk.shape[0], self.channels - out_chunk.shape[1]), dtype=self.dtype)
+                pad = np.zeros(
+                    (out_chunk.shape[0], self.channels - out_chunk.shape[1]),
+                    dtype=self.dtype,
+                )
                 out_chunk = np.concatenate([out_chunk, pad], axis=1)
             else:
                 out_chunk = out_chunk[:, : self.channels]
