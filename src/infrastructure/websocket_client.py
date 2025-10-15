@@ -1,11 +1,13 @@
 import asyncio
+from contextlib import suppress
 from typing import Callable, Optional
 
 import numpy as np
 import websockets
+from websockets import WebSocketClientProtocol
 
 from config.audio_config import AUDIO_WS_URL
-from dto.audio_message import AudioMessage
+from dto.audio_message import AudioMessage, np_to_base64
 
 
 class AudioWebSocketClient:
@@ -15,13 +17,14 @@ class AudioWebSocketClient:
         on_receive: Optional[Callable[[AudioMessage], None]] = None,
     ):
         self.url = url or AUDIO_WS_URL
-        self._ws = None
+        self._ws: Optional[WebSocketClientProtocol] = None
         self._on_receive = on_receive
-        self._recv_task = None
+        self._recv_task: Optional[asyncio.Task] = None
         self._connected = asyncio.Event()
         self._closing = False
 
     async def connect(self):
+        self._closing = False
         while True:
             try:
                 self._ws = await websockets.connect(self.url, max_size=None)
@@ -37,13 +40,18 @@ class AudioWebSocketClient:
         self._closing = True
         if self._recv_task:
             self._recv_task.cancel()
-        if self._ws and not self._ws.closed:
-            await self._ws.close()
+            with suppress(asyncio.CancelledError):
+                await self._recv_task
+            self._recv_task = None
+        if self._ws is not None:
+            close_coro = getattr(self._ws, "close", None)
+            if callable(close_coro):
+                await close_coro()
+        self._ws = None
+        self._connected.clear()
 
     async def send_audio_chunk(self, session_id: str, frame: np.ndarray):
         await self._connected.wait()
-        from dto.audio_message import np_to_base64
-
         msg = AudioMessage(
             type="audio_chunk",
             session_id=session_id,
@@ -67,3 +75,5 @@ class AudioWebSocketClient:
         except Exception as e:
             if not self._closing:
                 print(f"[WS] Receiver loop error: {e}")
+        finally:
+            self._connected.clear()

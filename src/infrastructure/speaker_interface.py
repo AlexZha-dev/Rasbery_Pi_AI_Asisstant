@@ -1,4 +1,3 @@
-import asyncio
 import queue
 import threading
 import time
@@ -49,6 +48,8 @@ class SpeakerInterface:
         self._stop_event = threading.Event()
         self._is_playing = False
         self._lock = threading.Lock()
+        self._started_event = threading.Event()
+        self._start_error: Optional[Exception] = None
 
     def set_output_device(self, device: int):
         with self._lock:
@@ -62,6 +63,8 @@ class SpeakerInterface:
         """Ставим фрейм в очередь воспроизведения. Асинхронное ожидание места реализуется через адаптер."""
         if samples is None:
             return
+        if not self.is_playing:
+            raise AudioError("Output stream is not started")
         arr = np.asarray(samples, dtype=self.dtype)
         if arr.ndim == 1:
             arr = arr.reshape(-1, 1)
@@ -106,9 +109,17 @@ class SpeakerInterface:
             if self._is_playing:
                 raise AudioError("Output already started")
             self._stop_event.clear()
+            self._started_event.clear()
+            self._start_error = None
+            self._drain_queue()
             self._thread = threading.Thread(target=self._thread_main, daemon=True)
             self._thread.start()
-            self._is_playing = True
+        if not self._started_event.wait(timeout=2.0):
+            raise AudioError("Speaker stream did not start in time")
+        if not self.is_playing:
+            if isinstance(self._start_error, Exception):
+                raise self._start_error
+            raise AudioError("Failed to initialise speaker stream")
 
     def _thread_main(self):
         try:
@@ -125,9 +136,15 @@ class SpeakerInterface:
                 )
             except Exception as e:
                 self._stream = None
-                raise AudioError(f"Unable to open output stream: {e}")
+                err = AudioError(f"Unable to open output stream: {e}")
+                self._start_error = err
+                self._started_event.set()
+                return
 
             self._stream.start()
+            with self._lock:
+                self._is_playing = True
+            self._started_event.set()
             while not self._stop_event.is_set():
                 time.sleep(0.05)
         finally:
@@ -139,6 +156,9 @@ class SpeakerInterface:
                     pass
             with self._lock:
                 self._is_playing = False
+            if self._start_error is None and not self._stop_event.is_set():
+                self._start_error = AudioError("Speaker stream stopped unexpectedly")
+            self._started_event.set()
 
     def stop_output(self):
         with self._lock:
@@ -147,14 +167,17 @@ class SpeakerInterface:
             self._stop_event.set()
         if self._thread is not None:
             self._thread.join(timeout=2.0)
+        self._started_event.clear()
+        self._drain_queue()
 
+    @property
+    def is_playing(self) -> bool:
+        with self._lock:
+            return self._is_playing
 
-# Асинхронный адаптер для работы с SpeakerInterface
-class SpeakerAsyncAdapter:
-    def __init__(self, spk: SpeakerInterface):
-        self.spk = spk
-
-    async def play(self, samples: np.ndarray):
-        """Асинхронно ждём место в очереди для воспроизведения."""
-        loop = asyncio.get_running_loop()
-        await loop.run_in_executor(None, self.spk.play, samples)
+    def _drain_queue(self) -> None:
+        while True:
+            try:
+                self._play_queue.get_nowait()
+            except queue.Empty:
+                return

@@ -30,6 +30,7 @@ class MicrophoneInterface:
         channels: int = 1,
         blocksize: int = 1024,
         dtype: str = "float32",
+        queue_max_blocks: int = 50,
     ):
         self.samplerate = samplerate
         self.channels = channels
@@ -46,7 +47,7 @@ class MicrophoneInterface:
         self._device = self._initial_input_device
 
         # Очередь для блоков сэмплов
-        self._queue: "queue.Queue[np.ndarray]" = queue.Queue()
+        self._queue: "queue.Queue[np.ndarray]" = queue.Queue(maxsize=queue_max_blocks)
 
         # Управление состоянием
         self._stream: Optional[sd.InputStream] = None
@@ -54,6 +55,8 @@ class MicrophoneInterface:
         self._stop_event = threading.Event()
         self._is_recording = False
         self._lock = threading.Lock()
+        self._started_event = threading.Event()
+        self._start_error: Optional[Exception] = None
 
     # ----- управление устройствами -----
     def set_input_device(self, device: int):
@@ -70,28 +73,21 @@ class MicrophoneInterface:
     # ----- callback для InputStream -----
     def _input_callback(self, indata, frames, time_info, status):
         if status:
-            # Не бросаем ошибку из callback — просто логируем в очередь
-            # Пользователь может читать и решить что делать
-            try:
-                # помещаем статус как 0-length массив с метаданными не делаем; просто игнорируем
-                pass
-            except Exception:
-                pass
+            self._signal_error(AudioError(f"Input stream status: {status}"))
+            return
         # indata shape: (frames, channels)
         # Если blocksize отличается от frames — нормализуем/сбрасываем
-        if frames != self.blocksize:
-            # Попытка ресемплирования внутри callback — плохая идея.
-            # Вместо этого мы просто буферизуем до blocksize в основном потоке.
-            # Здесь кладём то, что пришло (возможно неполный блок).
-            arr = np.asarray(indata, dtype=self.dtype).copy()
-        else:
-            arr = np.asarray(indata, dtype=self.dtype).copy()
+        arr = np.asarray(indata, dtype=self.dtype).copy()
         try:
             # Кладём даже неполные блоки — потребитель должен знать размер blocksize и объединять если нужно.
             self._queue.put_nowait(arr)
         except queue.Full:
-            # Пропускаем если очередь забита
-            pass
+            # Дропаем самый старый блок, чтобы не расти по памяти
+            try:
+                self._queue.get_nowait()
+                self._queue.put_nowait(arr)
+            except queue.Empty:
+                pass
 
     def start_recording(self):
         """Запустить запись в отдельном потоке.
@@ -101,9 +97,18 @@ class MicrophoneInterface:
             if self._is_recording:
                 raise AudioError("Recording already started")
             self._stop_event.clear()
+            self._started_event.clear()
+            self._start_error = None
+            self._drain_queue()
             self._thread = threading.Thread(target=self._thread_main, daemon=True)
             self._thread.start()
-            self._is_recording = True
+        # Ждём запуска потока, чтобы отлавливать ошибки открытия устройства
+        if not self._started_event.wait(timeout=2.0):
+            raise AudioError("Microphone stream did not start in time")
+        if not self.is_recording:
+            if isinstance(self._start_error, Exception):
+                raise self._start_error
+            raise AudioError("Failed to initialise microphone stream")
 
     def _thread_main(self):
         try:
@@ -122,19 +127,24 @@ class MicrophoneInterface:
                 # Попытка открыть поток на другом устройстве может упасть
                 self._stream = None
                 # кладём информацию об ошибке в очередь как исключение
-                raise AudioError(f"Unable to open input stream: {e}")
-
+                err = AudioError(f"Unable to open input stream: {e}")
+                self._start_error = err
+                self._signal_error(err)
+                self._started_event.set()
+                return
             # start stream и ждём stop_event
             self._stream.start()
+            with self._lock:
+                self._is_recording = True
+            self._started_event.set()
             while not self._stop_event.is_set():
                 time.sleep(0.05)
         except Exception as e:
             # В идеале: логгирование ошибки. Для простоты пробрасываем.
             # Чтобы не ломать основной поток, кладём объект исключения в очередь
-            try:
-                self._queue.put_nowait(e)
-            except Exception:
-                pass
+            if self._start_error is None:
+                self._start_error = e
+            self._signal_error(e)
         finally:
             if self._stream is not None:
                 try:
@@ -144,6 +154,7 @@ class MicrophoneInterface:
                     pass
             with self._lock:
                 self._is_recording = False
+            self._started_event.set()
 
     def stop_recording(self):
         with self._lock:
@@ -152,6 +163,7 @@ class MicrophoneInterface:
             self._stop_event.set()
         if self._thread is not None:
             self._thread.join(timeout=2.0)
+        self._started_event.clear()
 
     def get_samples(
         self, blocking: bool = False, timeout: Optional[float] = None
@@ -173,3 +185,26 @@ class MicrophoneInterface:
             raise item
 
         return item
+
+    @property
+    def is_recording(self) -> bool:
+        with self._lock:
+            return self._is_recording
+
+    def _drain_queue(self) -> None:
+        while True:
+            try:
+                self._queue.get_nowait()
+            except queue.Empty:
+                return
+
+    def _signal_error(self, err: Exception) -> None:
+        try:
+            self._queue.put_nowait(err)
+        except queue.Full:
+            # очередь забита данными, важно донести ошибку
+            try:
+                self._queue.get_nowait()
+                self._queue.put_nowait(err)
+            except queue.Empty:
+                pass
