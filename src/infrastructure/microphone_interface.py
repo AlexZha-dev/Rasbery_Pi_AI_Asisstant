@@ -57,6 +57,7 @@ class MicrophoneInterface:
         self._lock = threading.Lock()
         self._started_event = threading.Event()
         self._start_error: Optional[Exception] = None
+        self._stream_samplerate: Optional[float] = None
 
     # ----- управление устройствами -----
     def set_input_device(self, device: int):
@@ -78,6 +79,9 @@ class MicrophoneInterface:
         # indata shape: (frames, channels)
         # Если blocksize отличается от frames — нормализуем/сбрасываем
         arr = np.asarray(indata, dtype=self.dtype).copy()
+        stream_rate = self._stream_samplerate or self.samplerate
+        if stream_rate != self.samplerate and arr.size:
+            arr = self._resample(arr, stream_rate, self.samplerate)
         try:
             # Кладём даже неполные блоки — потребитель должен знать размер blocksize и объединять если нужно.
             self._queue.put_nowait(arr)
@@ -104,9 +108,11 @@ class MicrophoneInterface:
             self._thread.start()
         # Ждём запуска потока, чтобы отлавливать ошибки открытия устройства
         if not self._started_event.wait(timeout=2.0):
+            self._request_stop(join_timeout=2.0)
             raise AudioError("Microphone stream did not start in time")
         if not self.is_recording:
             if isinstance(self._start_error, Exception):
+                self._request_stop(join_timeout=2.0)
                 raise self._start_error
             raise AudioError("Failed to initialise microphone stream")
 
@@ -115,14 +121,7 @@ class MicrophoneInterface:
             with self._lock:
                 device = self._device
             try:
-                self._stream = sd.InputStream(
-                    samplerate=self.samplerate,
-                    blocksize=self.blocksize,
-                    dtype=self.dtype,
-                    channels=self.channels,
-                    callback=self._input_callback,
-                    device=device,
-                )
+                self._stream = self._open_stream(device, self.samplerate)
             except Exception as e:
                 # Попытка открыть поток на другом устройстве может упасть
                 self._stream = None
@@ -136,6 +135,9 @@ class MicrophoneInterface:
             self._stream.start()
             with self._lock:
                 self._is_recording = True
+                self._stream_samplerate = getattr(
+                    self._stream, "samplerate", self.samplerate
+                )
             self._started_event.set()
             while not self._stop_event.is_set():
                 time.sleep(0.05)
@@ -154,6 +156,7 @@ class MicrophoneInterface:
                     pass
             with self._lock:
                 self._is_recording = False
+                self._stream_samplerate = None
             self._started_event.set()
 
     def stop_recording(self):
@@ -164,6 +167,8 @@ class MicrophoneInterface:
         if self._thread is not None:
             self._thread.join(timeout=2.0)
         self._started_event.clear()
+        with self._lock:
+            self._stream_samplerate = None
 
     def get_samples(
         self, blocking: bool = False, timeout: Optional[float] = None
@@ -208,3 +213,60 @@ class MicrophoneInterface:
                 self._queue.put_nowait(err)
             except queue.Empty:
                 pass
+
+    def _resolve_default_samplerate(self, device) -> Optional[float]:
+        try:
+            info = sd.query_devices(device, "input")
+            rate = info.get("default_samplerate")
+            return float(rate) if rate else None
+        except Exception:
+            return None
+
+    def _open_stream(self, device, samplerate: float) -> sd.InputStream:
+        try:
+            stream = sd.InputStream(
+                samplerate=samplerate,
+                blocksize=self.blocksize,
+                dtype=self.dtype,
+                channels=self.channels,
+                callback=self._input_callback,
+                device=device,
+            )
+            return stream
+        except sd.PortAudioError as exc:
+            if "Invalid sample rate" in str(exc):
+                fallback = self._resolve_default_samplerate(device)
+                if fallback and fallback != samplerate:
+                    stream = sd.InputStream(
+                        samplerate=fallback,
+                        blocksize=self.blocksize,
+                        dtype=self.dtype,
+                        channels=self.channels,
+                        callback=self._input_callback,
+                        device=device,
+                    )
+                    return stream
+            raise
+
+    def _resample(
+        self, arr: np.ndarray, src_rate: float, dst_rate: float
+    ) -> np.ndarray:
+        if src_rate == dst_rate:
+            return arr
+        ratio = dst_rate / src_rate
+        dst_len = max(1, int(round(arr.shape[0] * ratio)))
+        orig_positions = np.linspace(0.0, 1.0, arr.shape[0], endpoint=False)
+        new_positions = np.linspace(0.0, 1.0, dst_len, endpoint=False)
+        resampled = np.empty((dst_len, arr.shape[1]), dtype=np.float32)
+        for idx in range(arr.shape[1]):
+            resampled[:, idx] = np.interp(new_positions, orig_positions, arr[:, idx])
+        return resampled.astype(self.dtype)
+
+    def _request_stop(self, join_timeout: float) -> None:
+        with self._lock:
+            self._stop_event.set()
+        if self._thread is not None:
+            self._thread.join(timeout=join_timeout)
+        self._started_event.clear()
+        with self._lock:
+            self._stream_samplerate = None

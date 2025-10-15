@@ -50,6 +50,7 @@ class SpeakerInterface:
         self._lock = threading.Lock()
         self._started_event = threading.Event()
         self._start_error: Optional[Exception] = None
+        self._stream_samplerate: Optional[float] = None
 
     def set_output_device(self, device: int):
         with self._lock:
@@ -68,6 +69,9 @@ class SpeakerInterface:
         arr = np.asarray(samples, dtype=self.dtype)
         if arr.ndim == 1:
             arr = arr.reshape(-1, 1)
+        stream_rate = self._stream_samplerate or self.samplerate
+        if stream_rate != self.samplerate and arr.size:
+            arr = self._resample(arr, self.samplerate, stream_rate)
         if arr.shape[0] != self.blocksize:
             if arr.shape[0] > self.blocksize:
                 arr = arr[: self.blocksize, ...]
@@ -115,9 +119,11 @@ class SpeakerInterface:
             self._thread = threading.Thread(target=self._thread_main, daemon=True)
             self._thread.start()
         if not self._started_event.wait(timeout=2.0):
+            self._request_stop(join_timeout=2.0)
             raise AudioError("Speaker stream did not start in time")
         if not self.is_playing:
             if isinstance(self._start_error, Exception):
+                self._request_stop(join_timeout=2.0)
                 raise self._start_error
             raise AudioError("Failed to initialise speaker stream")
 
@@ -126,24 +132,19 @@ class SpeakerInterface:
             with self._lock:
                 device = self._device
             try:
-                self._stream = sd.OutputStream(
-                    samplerate=self.samplerate,
-                    blocksize=self.blocksize,
-                    dtype=self.dtype,
-                    channels=self.channels,
-                    callback=self._output_callback,
-                    device=device,
-                )
+                self._stream = self._open_stream(device, self.samplerate)
             except Exception as e:
                 self._stream = None
-                err = AudioError(f"Unable to open output stream: {e}")
-                self._start_error = err
+                self._start_error = AudioError(f"Unable to open output stream: {e}")
                 self._started_event.set()
                 return
 
             self._stream.start()
             with self._lock:
                 self._is_playing = True
+                self._stream_samplerate = getattr(
+                    self._stream, "samplerate", self.samplerate
+                )
             self._started_event.set()
             while not self._stop_event.is_set():
                 time.sleep(0.05)
@@ -159,6 +160,8 @@ class SpeakerInterface:
             if self._start_error is None and not self._stop_event.is_set():
                 self._start_error = AudioError("Speaker stream stopped unexpectedly")
             self._started_event.set()
+            with self._lock:
+                self._stream_samplerate = None
 
     def stop_output(self):
         with self._lock:
@@ -181,3 +184,62 @@ class SpeakerInterface:
                 self._play_queue.get_nowait()
             except queue.Empty:
                 return
+
+    def _request_stop(self, join_timeout: float) -> None:
+        with self._lock:
+            self._stop_event.set()
+        if self._thread is not None:
+            self._thread.join(timeout=join_timeout)
+        self._started_event.clear()
+        self._drain_queue()
+        with self._lock:
+            self._stream_samplerate = None
+
+    def _resolve_default_samplerate(self, device) -> Optional[float]:
+        try:
+            info = sd.query_devices(device, "output")
+            rate = info.get("default_samplerate")
+            return float(rate) if rate else None
+        except Exception:
+            return None
+
+    def _open_stream(self, device, samplerate: float) -> sd.OutputStream:
+        try:
+            stream = sd.OutputStream(
+                samplerate=samplerate,
+                blocksize=self.blocksize,
+                dtype=self.dtype,
+                channels=self.channels,
+                callback=self._output_callback,
+                device=device,
+            )
+            return stream
+        except sd.PortAudioError as exc:
+            if "Invalid sample rate" in str(exc):
+                fallback = self._resolve_default_samplerate(device)
+                if fallback and fallback != samplerate:
+                    stream = sd.OutputStream(
+                        samplerate=fallback,
+                        blocksize=self.blocksize,
+                        dtype=self.dtype,
+                        channels=self.channels,
+                        callback=self._output_callback,
+                        device=device,
+                    )
+                    return stream
+            raise
+
+    def _resample(
+        self, arr: np.ndarray, src_rate: float, dst_rate: float
+    ) -> np.ndarray:
+        if src_rate == dst_rate:
+            return arr
+        ratio = dst_rate / src_rate
+        dst_len = max(1, int(round(arr.shape[0] * ratio)))
+        # quick linear interpolation per channel
+        orig_positions = np.linspace(0.0, 1.0, arr.shape[0], endpoint=False)
+        new_positions = np.linspace(0.0, 1.0, dst_len, endpoint=False)
+        resampled = np.empty((dst_len, arr.shape[1]), dtype=np.float32)
+        for idx in range(arr.shape[1]):
+            resampled[:, idx] = np.interp(new_positions, orig_positions, arr[:, idx])
+        return resampled.astype(self.dtype)
