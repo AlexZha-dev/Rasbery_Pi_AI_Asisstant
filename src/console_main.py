@@ -30,8 +30,8 @@ async def main() -> None:
         return session, ws_client
 
     def request_stop():
+        # Stop only microphone; keep speaker running to play server response
         microphone.stop_recording()
-        speaker.stop_output()
 
     runner = SessionRunner(session_factory, request_stop)
     controller = ConsoleController(

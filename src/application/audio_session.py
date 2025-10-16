@@ -27,8 +27,8 @@ class AudioSession:
 
     async def run_once(
         self,
-        timeout: float = 10.0,
-        playback_timeout: Optional[float] = 5.0,
+        timeout: Optional[float] = None,
+        playback_timeout: Optional[float] = None,
     ):
         print(f"[Session {self.session_id}] Started")
         await self.ws.connect()
@@ -43,19 +43,18 @@ class AudioSession:
         run_error: Optional[Exception] = None
         try:
             try:
-                await asyncio.wait_for(self._recording_done(), timeout)
+                if timeout is not None:
+                    await asyncio.wait_for(self._recording_done(), timeout)
+                else:
+                    # Wait indefinitely until recording is stopped by user
+                    await self._recording_done()
             except asyncio.TimeoutError:
+                # Timed recording window elapsed; proceed to stop
                 pass
         except Exception as exc:  # pragma: no cover - unexpected flow
             run_error = exc
         finally:
             self.mic.mic.stop_recording()
-
-        try:
-            await self.ws.send_control(self.session_id, "end_session")
-        except Exception as exc:
-            if run_error is None:
-                run_error = exc
 
         try:
             if playback_timeout is not None:
@@ -69,6 +68,13 @@ class AudioSession:
             if run_error is None:
                 run_error = AudioError("Sender task timed out")
                 run_error.__cause__ = exc
+        except Exception as exc:
+            if run_error is None:
+                run_error = exc
+
+        # Notify the server that input has ended and we are ready for the response
+        try:
+            await self.ws.send_control(self.session_id, "end_session")
         except Exception as exc:
             if run_error is None:
                 run_error = exc
@@ -93,10 +99,21 @@ class AudioSession:
             raise run_error
 
     async def _send_loop(self):
+        # Stream while recording is active
         while self.mic.mic.is_recording:
             samples = await self.mic.get_samples()
             if samples is not None:
                 await self.ws.send_audio_chunk(self.session_id, samples)
+        # After recording stops, drain any remaining buffered frames briefly
+        idle_after_stop = 0
+        max_idle_iters = 100  # ~1s given MicrophoneAsyncAdapter sleep of 10ms
+        while idle_after_stop < max_idle_iters:
+            samples = await self.mic.get_samples()
+            if samples is None:
+                idle_after_stop += 1
+                continue
+            idle_after_stop = 0
+            await self.ws.send_audio_chunk(self.session_id, samples)
         print(f"[Session {self.session_id}] Sender finished")
 
     async def _recording_done(self):

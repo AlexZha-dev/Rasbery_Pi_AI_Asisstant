@@ -26,8 +26,8 @@ class SessionRunner:
         self,
         session_factory: SessionFactory,
         request_stop: StopCallback,
-        session_timeout: float = 10.0,
-        playback_timeout: float = 5.0,
+        session_timeout: Optional[float] = None,
+        playback_timeout: Optional[float] = None,
         join_timeout: float = 5.0,
         loop: Optional[asyncio.AbstractEventLoop] = None,
     ):
