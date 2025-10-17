@@ -21,7 +21,9 @@ class AudioSession:
         self._playback_finished = False
         self._playback_meta: Optional[Dict[str, Any]] = None
         self._pending_playback_files: int = 0
-        self._playback_session_active: bool = False  # wrapper: playback.start -> playback.end
+        self._playback_session_active: bool = (
+            False  # wrapper: playback.start -> playback.end
+        )
         self._final_event_received = False
         ws._on_receive = self._on_receive
         ws._on_receive_binary = self._on_binary
@@ -308,7 +310,7 @@ class AudioSession:
         if channels > 1:
             frame_count = arr.size // channels
             if frame_count == 0:
-                    return None
+                return None
             arr = arr[: frame_count * channels].reshape(frame_count, channels)
         else:
             arr = arr.reshape(-1, 1)

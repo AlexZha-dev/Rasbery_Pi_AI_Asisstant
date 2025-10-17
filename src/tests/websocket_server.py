@@ -126,12 +126,18 @@ async def handle_client(ws):
                 print(f"[SERVER] End session {sid}")
 
                 frames = sessions.get(sid, [])
-                combined = np.concatenate(frames, axis=0) if frames else np.zeros((0, channels))
+                combined = (
+                    np.concatenate(frames, axis=0)
+                    if frames
+                    else np.zeros((0, channels))
+                )
                 filename = f"{sid}.wav"
                 filepath = os.path.join(OUTPUT_DIR, filename)
                 try:
                     if combined.size:
-                        sf.write(filepath, combined, samplerate=sample_rate, subtype="PCM_16")
+                        sf.write(
+                            filepath, combined, samplerate=sample_rate, subtype="PCM_16"
+                        )
                         print(f"[SERVER] Saved session to {filepath}")
                 except Exception as e:
                     print(f"[SERVER] Failed to save WAV: {e}")
@@ -151,8 +157,12 @@ async def handle_client(ws):
                                 }
                             )
                         )
-                    await ws.send(json.dumps({"type": "end_session", "session_id": sid}))
-                    await ws.send(json.dumps({"type": "playback_done", "session_id": sid}))
+                    await ws.send(
+                        json.dumps({"type": "end_session", "session_id": sid})
+                    )
+                    await ws.send(
+                        json.dumps({"type": "playback_done", "session_id": sid})
+                    )
                 else:
                     turn_id = f"{sid}-turn"
                     utterances_total = 1 if combined.size else 0

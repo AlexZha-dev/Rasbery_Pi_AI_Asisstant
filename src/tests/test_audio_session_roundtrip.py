@@ -10,7 +10,6 @@ import pytest_asyncio
 import websockets
 
 import config.audio_config as audio_config
-
 from application.audio_session import AudioSession
 from infrastructure.sounds_adapters import MicrophoneAsyncAdapter, SpeakerAsyncAdapter
 from infrastructure.websocket_client import AudioWebSocketClient
