@@ -33,7 +33,12 @@ async def main() -> None:
         # Stop only microphone; keep speaker running to play server response
         microphone.stop_recording()
 
-    runner = SessionRunner(session_factory, request_stop)
+    runner = SessionRunner(
+        session_factory,
+        request_stop,
+        playback_timeout=30.0,
+        join_timeout=35.0,
+    )
     controller = ConsoleController(
         microphone=microphone,
         speaker=speaker,

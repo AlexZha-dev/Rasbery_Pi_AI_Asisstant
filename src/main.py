@@ -16,7 +16,7 @@ async def main():
     ws_client = AudioWebSocketClient()
 
     session = AudioSession(ws_client, mic_adapter, spk_adapter)
-    await session.run_once(timeout=5)
+    await session.run_once(timeout=5, playback_timeout=30.0)
 
     await ws_client.close()
 

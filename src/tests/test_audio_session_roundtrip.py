@@ -9,10 +9,12 @@ import pytest
 import pytest_asyncio
 import websockets
 
+import config.audio_config as audio_config
+
 from application.audio_session import AudioSession
 from infrastructure.sounds_adapters import MicrophoneAsyncAdapter, SpeakerAsyncAdapter
 from infrastructure.websocket_client import AudioWebSocketClient
-from tests.websocket_server import OUTPUT_DIR, handle_client, sessions
+from tests.websocket_server import OUTPUT_DIR, handle_client, sessions, start_params
 
 os.environ.setdefault("AUDIO_WS_URL", "ws://127.0.0.1:8765")
 
@@ -62,9 +64,14 @@ class DummySpeakerInterface:
 
 
 @pytest_asyncio.fixture
-async def audio_test_server(monkeypatch):
-    url = "ws://127.0.0.1:8765"
+async def audio_test_server(monkeypatch, mode):
+    # Switch between legacy JSON endpoint and binary '/ws/audio'
+    if mode == "binary":
+        url = "ws://127.0.0.1:8765/ws/audio"
+    else:
+        url = "ws://127.0.0.1:8765"
     monkeypatch.setenv("AUDIO_WS_URL", url)
+    monkeypatch.setattr(audio_config, "AUDIO_WS_URL", url)
     target = Path(OUTPUT_DIR) / "test-session.wav"
     if target.exists():
         target.unlink()
@@ -74,11 +81,12 @@ async def audio_test_server(monkeypatch):
     except OSError as exc:  # pragma: no cover - sandboxed CI without socket perms
         pytest.skip(f"Unable to start local websocket test server: {exc}")
     try:
-        yield target
+        yield target, url
     finally:
         server.close()
         await server.wait_closed()
         sessions.clear()
+        start_params.clear()
         if target.exists():
             target.unlink()
 
@@ -91,7 +99,9 @@ async def run_with_timeout(coro: Awaitable, seconds: float, stage: str):
 
 
 @pytest.mark.asyncio
-async def test_audio_session_roundtrip(audio_test_server):
+@pytest.mark.parametrize("mode", ["json", "binary"])  # exercise both protocols
+async def test_audio_session_roundtrip(audio_test_server, mode):
+    target, url = audio_test_server
     blocksize = 1024
     samplerate = 16000
     frames = []
@@ -104,17 +114,22 @@ async def test_audio_session_roundtrip(audio_test_server):
     spk = DummySpeakerInterface()
     mic_adapter = MicrophoneAsyncAdapter(mic)
     spk_adapter = SpeakerAsyncAdapter(spk)
-    ws_client = AudioWebSocketClient()
+    ws_client = AudioWebSocketClient(url=url)
     session = AudioSession(ws_client, mic_adapter, spk_adapter)
     session.session_id = "test-session"
 
     await run_with_timeout(session.run_once(timeout=0.2), 5.0, "session run")
     await run_with_timeout(ws_client.close(), 2.0, "websocket close")
+    assert ws_client.closed_by_server is False
 
     assert spk.frames, "Speaker did not receive any frames"
     combined = np.concatenate(spk.frames, axis=0)
     assert combined.ndim == 2
     assert combined.shape[1] == 1
 
-    target = audio_test_server
     assert target.exists(), "Websocket server did not persist WAV output"
+    if mode == "binary":
+        params = start_params.get("test-session")
+        assert params is not None
+        expected_chunk_bytes = blocksize * params["channels"] * params["sampwidth"]
+        assert params["chunk_size"] == expected_chunk_bytes
