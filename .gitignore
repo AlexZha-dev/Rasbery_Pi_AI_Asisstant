@@ -4,3 +4,4 @@ __pycache__/
 outputs/
 AGENTS.md
 src/config/user_prefs.json
+src/.env
