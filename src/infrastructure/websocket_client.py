@@ -1,7 +1,10 @@
 import asyncio
 import json
+import logging
+import time
 from contextlib import suppress
-from typing import Callable, Optional
+from datetime import datetime, timezone
+from typing import Callable, Dict, Optional
 from urllib.parse import urlsplit
 
 import numpy as np
@@ -11,8 +14,52 @@ from websockets import WebSocketClientProtocol
 from config.audio_config import AUDIO_WS_URL
 from dto.audio_message import AudioMessage, np_to_base64
 
+logger = logging.getLogger(__name__)
+if not logger.handlers:
+    handler = logging.StreamHandler()
+    handler.setFormatter(logging.Formatter("%(message)s"))
+    logger.addHandler(handler)
+logger.setLevel(logging.INFO)
+logger.propagate = False
+
+
+def _utc_timestamp() -> str:
+    return (
+        datetime.now(timezone.utc)
+        .isoformat(timespec="milliseconds")
+        .replace("+00:00", "Z")
+    )
+
+
+def _truncate_text(text: str, limit: int = 160) -> str:
+    if text is None:
+        return ""
+    compact = " ".join(text.split())
+    if len(compact) <= limit:
+        return compact
+    return compact[: limit - 3] + "..."
+
+
+def _headers_to_dict(headers) -> Dict[str, str]:
+    if headers is None:
+        return {}
+    try:
+        items = headers.raw_items()
+    except AttributeError:
+        try:
+            items = headers.items()
+        except AttributeError:
+            return {}
+    result: Dict[str, str] = {}
+    for key, value in items:
+        result[str(key)] = str(value)
+    return result
+
 
 class AudioWebSocketClient:
+    _SESSION_INDEX = 0
+    _ACTIVE_SESSIONS = 0
+
     def __init__(
         self,
         url: Optional[str] = None,
@@ -37,6 +84,177 @@ class AudioWebSocketClient:
         self._closed_by_server = False
         self._close_code: Optional[int] = None
         self._close_reason: Optional[str] = None
+        self._server_close_rcvd: bool = False
+        self._close_cause: Optional[str] = None
+        self._close_trigger_source: Optional[str] = None
+        self._close_trigger_detail: Optional[str] = None
+        self._closed_at: Optional[float] = None
+
+        # Diagnostics
+        self._session_name: Optional[str] = None
+        self._connected_at: Optional[float] = None
+        self._handshake_request_headers: Dict[str, str] = {}
+        self._handshake_response_headers: Dict[str, str] = {}
+        self._handshake_subprotocol: Optional[str] = None
+        self._reported_session_id: Optional[str] = None
+        self._sent_frames: int = 0
+        self._sent_bytes: int = 0
+        self._recv_frames: int = 0
+        self._recv_bytes: int = 0
+        self._last_event_type: Optional[str] = None
+        self._close_logged: bool = False
+        self._initiator: Optional[str] = None
+
+    # --------------------------------------------------------------------- utils
+    def _current_session_label(self) -> str:
+        return self._reported_session_id or self._session_name or "unbound"
+
+    def _log(
+        self, tag: str, message: str, level: int = logging.INFO, *, exc_info=False
+    ):
+        logger.log(
+            level,
+            f"[{tag}] ts={_utc_timestamp()} session={self._current_session_label()} {message}",
+            exc_info=exc_info,
+        )
+
+    def note_close_trigger(self, source: str, detail: Optional[str] = None) -> None:
+        parts = [f"source={source}"]
+        if detail:
+            parts.append(f"detail={detail}")
+        if self._close_trigger_source is None:
+            self._close_trigger_source = source
+            self._close_trigger_detail = detail
+        else:
+            parts.append("ignored=True")
+        self._log("WS_CLOSE_TRIGGER", " ".join(parts))
+
+    def _log_frame(
+        self,
+        direction: str,
+        frame_type: str,
+        payload,
+        *,
+        session_id: Optional[str] = None,
+        message_type: Optional[str] = None,
+        extra: Optional[str] = None,
+        level: int = logging.INFO,
+    ) -> None:
+        if isinstance(payload, (bytes, bytearray)):
+            size = len(payload)
+            snippet = None
+        else:
+            text = str(payload)
+            size = len(text.encode("utf-8", "ignore"))
+            snippet = _truncate_text(text)
+        parts = [direction, frame_type, f"len={size}"]
+        if message_type:
+            parts.append(f"type={message_type}")
+        if session_id:
+            parts.append(f"session_id={session_id}")
+        if snippet:
+            parts.append(f"snippet={snippet}")
+        if extra:
+            parts.append(extra)
+        self._log("WS_MESSAGE", " ".join(parts), level=level)
+
+    def _record_session_id(self, session_id: Optional[str]) -> None:
+        if session_id:
+            self._reported_session_id = session_id
+
+    def _emit_close_log(
+        self,
+        *,
+        initiator: str,
+        code: Optional[int],
+        reason: Optional[str],
+        server_close: bool,
+    ) -> None:
+        if self._close_logged:
+            return
+        duration = None
+        if self._connected_at is not None:
+            duration = max(0.0, time.monotonic() - self._connected_at)
+        if self._closed_at is None:
+            self._closed_at = time.monotonic()
+        detail_parts = [
+            f"initiator={initiator}",
+            f"code={code if code is not None else 'n/a'}",
+            f"reason={reason or '-'}",
+            f"cause={self._close_cause or '-'}",
+            f"trigger={self._close_trigger_source or '-'}",
+            f"server_close={server_close}",
+        ]
+        if self._close_trigger_detail:
+            detail_parts.append(f"trigger_detail={self._close_trigger_detail}")
+        if duration is not None:
+            detail_parts.append(f"duration_s={duration:.3f}")
+            detail_parts.append(f"duration_ms={duration * 1000:.1f}")
+        if self._last_event_type:
+            detail_parts.append(f"last_event={self._last_event_type}")
+        self._log("WS_CLOSE", " ".join(detail_parts))
+
+        if AudioWebSocketClient._ACTIVE_SESSIONS > 0:
+            AudioWebSocketClient._ACTIVE_SESSIONS -= 1
+        summary_session = self._current_session_label()
+        summary_parts = [
+            f"session={summary_session}",
+            f"sent={self._sent_frames}",
+            f"recv={self._recv_frames}",
+            f"sent_bytes={self._sent_bytes}",
+            f"recv_bytes={self._recv_bytes}",
+            f"active={AudioWebSocketClient._ACTIVE_SESSIONS}",
+        ]
+        if duration is not None:
+            summary_parts.append(f"duration_s={duration:.3f}")
+        summary_parts.append(f"last_event={self._last_event_type or '-'}")
+        if self._close_trigger_source:
+            summary_parts.append(f"trigger={self._close_trigger_source}")
+        if self._close_cause:
+            summary_parts.append(f"cause={self._close_cause}")
+        self._log("WS_SUMMARY", " ".join(summary_parts))
+        self._close_logged = True
+
+    # --------------------------------------------------------------------- core
+    async def _send_text(
+        self,
+        payload: str,
+        *,
+        session_id: Optional[str] = None,
+        message_type: Optional[str] = None,
+        extra: Optional[str] = None,
+    ) -> None:
+        await self._ws.send(payload)
+        self._sent_frames += 1
+        self._sent_bytes += len(payload.encode("utf-8", "ignore"))
+        self._log_frame(
+            ">",
+            "text",
+            payload,
+            session_id=session_id,
+            message_type=message_type,
+            extra=extra,
+        )
+
+    async def _send_binary(
+        self,
+        payload: bytes,
+        *,
+        session_id: Optional[str] = None,
+        message_type: Optional[str] = None,
+        extra: Optional[str] = None,
+    ) -> None:
+        await self._ws.send(payload)
+        self._sent_frames += 1
+        self._sent_bytes += len(payload)
+        self._log_frame(
+            ">",
+            "binary",
+            payload,
+            session_id=session_id,
+            message_type=message_type,
+            extra=extra,
+        )
 
     @staticmethod
     def _infer_mode_from_url(url: str) -> str:
@@ -54,20 +272,81 @@ class AudioWebSocketClient:
         self._closed_by_server = False
         self._close_code = None
         self._close_reason = None
+        self._server_close_rcvd = False
+        self._close_logged = False
+        self._reported_session_id = None
+        self._sent_frames = 0
+        self._sent_bytes = 0
+        self._recv_frames = 0
+        self._recv_bytes = 0
+        self._last_event_type = None
+        self._handshake_request_headers = {}
+        self._handshake_response_headers = {}
+        self._handshake_subprotocol = None
+        self._session_name = None
+        self._connected_at = None
+        self._initiator = None
+        self._close_cause = None
+        self._close_trigger_source = None
+        self._close_trigger_detail = None
+        self._closed_at = None
         self._ready_event.clear()
         while True:
             try:
                 self._ws = await websockets.connect(self.url, max_size=None)
+                AudioWebSocketClient._SESSION_INDEX += 1
+                self._session_name = f"ws-{AudioWebSocketClient._SESSION_INDEX}"
+                AudioWebSocketClient._ACTIVE_SESSIONS += 1
+                self._connected_at = time.monotonic()
+                self._handshake_request_headers = _headers_to_dict(
+                    getattr(self._ws, "request_headers", None)
+                )
+                self._handshake_response_headers = _headers_to_dict(
+                    getattr(self._ws, "response_headers", None)
+                )
+                self._handshake_subprotocol = getattr(self._ws, "subprotocol", None)
+                handshake_extra = {
+                    "request_headers": self._handshake_request_headers,
+                    "response_headers": self._handshake_response_headers,
+                }
+                self._log(
+                    "WS_OPEN",
+                    " ".join(
+                        [
+                            f"url={self.url}",
+                            f"subprotocol={self._handshake_subprotocol or '-'}",
+                            f"active={AudioWebSocketClient._ACTIVE_SESSIONS}",
+                            f"handshake={_truncate_text(json.dumps(handshake_extra))}",
+                        ]
+                    ),
+                )
                 self._connected.set()
                 self._recv_task = asyncio.create_task(self._receiver_loop())
-                print(f"[WS] Connected to {self.url}")
                 return
-            except Exception as e:
-                print(f"[WS] Connection failed: {e}. Retrying...")
+            except Exception as exc:
+                self._log(
+                    "WS_ERROR",
+                    f"connection_failed url={self.url} error={exc}",
+                    level=logging.WARNING,
+                    exc_info=True,
+                )
                 await asyncio.sleep(2)
 
-    async def close(self):
+    async def close(
+        self, reason: str = "client_shutdown", trigger: Optional[str] = None
+    ):
+        if trigger and not self._close_trigger_source:
+            self.note_close_trigger(trigger, detail=reason)
+        elif not self._close_trigger_source:
+            self.note_close_trigger("client.close", detail=reason)
+        if not self._close_cause or self._close_cause in {
+            "client_shutdown",
+            "client_close",
+        }:
+            self._close_cause = reason or "client_shutdown"
+        self._log("WS", f"close_requested cause={self._close_cause}")
         self._closing = True
+        self._initiator = self._initiator or "client"
         if self._recv_task:
             self._recv_task.cancel()
             with suppress(asyncio.CancelledError):
@@ -76,11 +355,43 @@ class AudioWebSocketClient:
         if self._ws is not None:
             close_coro = getattr(self._ws, "close", None)
             if callable(close_coro):
-                await close_coro()
+                try:
+                    await close_coro()
+                except Exception as exc:
+                    self._log(
+                        "WS_ERROR",
+                        f"close_handshake_error error={exc}",
+                        level=logging.ERROR,
+                        exc_info=True,
+                    )
+            self._close_code = getattr(self._ws, "close_code", self._close_code)
+            self._close_reason = getattr(self._ws, "close_reason", self._close_reason)
+            server_close = self._server_close_rcvd or bool(
+                getattr(self._ws, "close_rcvd", None)
+            )
+        else:
+            server_close = self._server_close_rcvd
+        self._emit_close_log(
+            initiator=self._initiator or "client",
+            code=self._close_code,
+            reason=self._close_reason,
+            server_close=server_close,
+        )
         self._ws = None
         self._connected.clear()
         self._ready_event.clear()
         self._reset_binary_state()
+        self._log(
+            "WS_CLEANUP",
+            " ".join(
+                [
+                    f"reason={reason}",
+                    f"server_closed={self._closed_by_server}",
+                    f"code={self._close_code}",
+                    f"server_reason={self._close_reason or '-'}",
+                ]
+            ),
+        )
 
     async def prepare_stream(
         self,
@@ -118,7 +429,14 @@ class AudioWebSocketClient:
             "channels": channels,
             "sampwidth": sampwidth,
         }
-        await self._ws.send(json.dumps(start_msg))
+        payload = json.dumps(start_msg)
+        self._record_session_id(session_id)
+        await self._send_text(
+            payload,
+            session_id=session_id,
+            message_type="start",
+            extra=f"chunk_bytes={chunk_bytes}",
+        )
         await self._wait_for_ready()
 
     async def send_audio_chunk(self, session_id: str, frame: np.ndarray):
@@ -139,8 +457,25 @@ class AudioWebSocketClient:
             payload = self._encode_pcm(frame)
             if not payload:
                 return
-            await self._ws.send(payload)
+            chunk_index = self._binary_chunks_sent + 1
+            await self._send_binary(
+                payload,
+                session_id=session_id,
+                message_type="audio_chunk",
+                extra=f"index={chunk_index}",
+            )
+            if self._binary_chunks_sent == 0:
+                self._log(
+                    "WS",
+                    f"> binary_first_chunk len={len(payload)} "
+                    f"channels={self._binary_channels} sampwidth={self._binary_expected_sampwidth}",
+                )
             self._binary_chunks_sent += 1
+            if (self._binary_chunks_sent % 100) == 0:
+                self._log(
+                    "WS",
+                    f"> binary_chunks_sent={self._binary_chunks_sent}",
+                )
             return
 
         # JSON mode (legacy/test server)
@@ -151,17 +486,31 @@ class AudioWebSocketClient:
             dtype=str(frame.dtype),
             shape=frame.shape,
         )
-        await self._ws.send(msg.to_json())
+        payload = msg.to_json()
+        self._record_session_id(session_id)
+        await self._send_text(
+            payload,
+            session_id=session_id,
+            message_type="audio_chunk",
+            extra=f"dtype={msg.dtype} shape={msg.shape}",
+        )
 
     async def send_control(self, session_id: str, control_type: str, **extra):
         await self._connected.wait()
+        self._record_session_id(session_id)
         if self._mode == "binary" and control_type == "end_session":
             end_msg = {
                 "type": "end_of_chunks",
                 "session_id": session_id,
                 "chunks_sent": int(self._binary_chunks_sent),
             }
-            await self._ws.send(json.dumps(end_msg))
+            payload = json.dumps(end_msg)
+            await self._send_text(
+                payload,
+                session_id=session_id,
+                message_type="end_of_chunks",
+                extra=f"chunks_sent={self._binary_chunks_sent}",
+            )
             self._reset_binary_state()
             return
 
@@ -173,34 +522,111 @@ class AudioWebSocketClient:
             session_id=session_id,
             extra=extra or None,
         )
-        await self._ws.send(msg.to_json())
+        payload = msg.to_json()
+        extra_str = (
+            " ".join(f"{key}={value}" for key, value in sorted(extra.items()))
+            if extra
+            else None
+        )
+        await self._send_text(
+            payload,
+            session_id=session_id,
+            message_type=target_type,
+            extra=extra_str,
+        )
 
     async def send_playback(self, session_id: str, mode: str = "background"):
         await self.send_control(session_id, "playback", mode=mode)
+        self._log("WS", f"> playback_request mode={mode} session_id={session_id}")
 
     async def send_playback_stop(self, session_id: str):
         await self.send_control(session_id, "playback_stop")
+        self._log("WS", f"> playback_stop session_id={session_id}")
+
+    async def send_playback_ack(
+        self, session_id: str, message_id: str, status: str = "played"
+    ) -> None:
+        await self._connected.wait()
+        payload = {
+            "type": "playback_ack",
+            "message_id": message_id,
+            "status": status,
+        }
+        self._record_session_id(session_id)
+        await self._send_text(
+            json.dumps(payload),
+            session_id=session_id,
+            message_type="playback_ack",
+            extra=f"message_id={message_id} status={status}",
+        )
 
     async def _receiver_loop(self):
         try:
             async for msg_raw in self._ws:
                 if isinstance(msg_raw, (bytes, bytearray)):
+                    self._recv_frames += 1
+                    self._recv_bytes += len(msg_raw)
+                    self._log_frame(
+                        "<",
+                        "binary",
+                        msg_raw,
+                        message_type="audio_binary",
+                    )
+                    self._last_event_type = "binary_frame"
                     if self._on_receive_binary:
                         result = self._on_receive_binary(bytes(msg_raw))
                         if asyncio.iscoroutine(result):
                             try:
                                 await result
                             except Exception as exc:
-                                print(f"[WS] Binary handler error: {exc}")
+                                self._log(
+                                    "WS_ERROR",
+                                    f"binary_handler_error error={exc}",
+                                    level=logging.ERROR,
+                                    exc_info=True,
+                                )
                     continue
 
-                if isinstance(msg_raw, str) and self._handle_text_signal(msg_raw):
-                    continue
+                if isinstance(msg_raw, str):
+                    self._recv_frames += 1
+                    self._recv_bytes += len(msg_raw.encode("utf-8", "ignore"))
+                    stripped = (msg_raw or "").strip().lower()
+                    if stripped == "ready":
+                        self._ready_event.set()
+                        self._last_event_type = "ready"
+                        self._log_frame("<", "text", msg_raw, message_type="ready")
+                        continue
+                    if stripped.startswith("ack:"):
+                        self._last_event_type = "ack_signal"
+                        self._log_frame("<", "text", msg_raw, message_type="ack")
+                        self._log_ack(stripped)
+                        continue
 
                 try:
                     msg = AudioMessage.from_json(msg_raw)
                 except Exception:
+                    if isinstance(msg_raw, str):
+                        self._log_frame("<", "text", msg_raw)
                     continue
+
+                session_id = msg.session_id
+                self._record_session_id(session_id)
+                message_type = msg.type or "unknown"
+                extra = None
+                if msg.extra:
+                    try:
+                        extra = f"extra={_truncate_text(json.dumps(msg.extra))}"
+                    except (TypeError, ValueError):
+                        extra = "extra=<unserializable>"
+                self._log_frame(
+                    "<",
+                    "text",
+                    msg_raw,
+                    session_id=session_id,
+                    message_type=message_type,
+                    extra=extra,
+                )
+                self._last_event_type = message_type
 
                 if msg.type == "ready":
                     self._ready_event.set()
@@ -208,23 +634,67 @@ class AudioWebSocketClient:
                 if msg.type and msg.type.startswith("ack"):
                     self._log_ack(msg.type)
                     continue
+                if msg.type in {
+                    "response.start",
+                    "response.end",
+                    "playback.start",
+                    "playback.end",
+                    "playback_file_start",
+                    "playback_file_done",
+                    "playback.queue_status",
+                    "playback_stopped",
+                }:
+                    # Lightweight debug hook
+                    self._log(
+                        "WS",
+                        f"< {msg.type} session_id={msg.session_id}",
+                    )
 
                 if self._on_receive:
                     try:
                         await self._on_receive(msg)
                     except Exception as exc:
-                        print(f"[WS] Message handler error: {exc}")
+                        self._log(
+                            "WS_ERROR",
+                            f"message_handler_error error={exc}",
+                            level=logging.ERROR,
+                            exc_info=True,
+                        )
         except websockets.ConnectionClosed as exc:
+            self._close_code = getattr(exc, "code", self._close_code)
+            self._close_reason = getattr(exc, "reason", self._close_reason)
+            self._server_close_rcvd = bool(getattr(exc, "rcvd", None))
+            initiator = "client" if self._closing else "server"
             if not self._closing:
                 self._closed_by_server = True
-                self._close_code = getattr(exc, "code", None)
-                self._close_reason = getattr(exc, "reason", None)
-                print(
-                    f"[WS] Connection closed by server: code={self._close_code} reason={self._close_reason}"
-                )
-        except Exception as e:
+                self._close_cause = self._close_cause or "server_close"
+                if not self._close_trigger_source:
+                    detail = None
+                    if self._close_reason:
+                        detail = self._close_reason
+                    elif self._close_code is not None:
+                        detail = f"code={self._close_code}"
+                    self.note_close_trigger("server.close_frame", detail=detail)
+            else:
+                self._close_cause = self._close_cause or "client_close"
+            self._initiator = self._initiator or initiator
+            self._emit_close_log(
+                initiator=initiator,
+                code=self._close_code,
+                reason=self._close_reason,
+                server_close=self._server_close_rcvd,
+            )
+        except Exception as exc:
             if not self._closing:
-                print(f"[WS] Receiver loop error: {e}")
+                self._close_cause = self._close_cause or "error"
+                if not self._close_trigger_source:
+                    self.note_close_trigger("receiver_loop", detail=str(exc))
+                self._log(
+                    "WS_ERROR",
+                    f"receiver_loop_error error={exc}",
+                    level=logging.ERROR,
+                    exc_info=True,
+                )
         finally:
             self._connected.clear()
             self._ready_event.clear()
@@ -241,26 +711,19 @@ class AudioWebSocketClient:
         try:
             await asyncio.wait_for(self._ready_event.wait(), timeout=timeout)
         except asyncio.TimeoutError:
-            print("[WS] Timed out waiting for server ready signal")
-
-    def _handle_text_signal(self, text: str) -> bool:
-        stripped = (text or "").strip()
-        if not stripped:
-            return False
-        if stripped.lower() == "ready":
-            self._ready_event.set()
-            return True
-        if stripped.lower().startswith("ack:"):
-            self._log_ack(stripped)
-            return True
-        return False
+            self._log(
+                "WS_ERROR",
+                f"ready_wait_timeout timeout={timeout}",
+                level=logging.WARNING,
+            )
 
     def _log_ack(self, payload: str) -> None:
         try:
             count = int(payload.split(":", 1)[1])
         except (IndexError, ValueError):
             return
-        print(f"[WS] Ack {count}")
+        self._last_event_type = "ack"
+        self._log("WS_MESSAGE", f"< ack count={count}")
 
     def _encode_pcm(self, frame: np.ndarray) -> bytes:
         arr = np.asarray(frame, dtype=np.float32)
@@ -282,7 +745,11 @@ class AudioWebSocketClient:
         elif sampwidth == 4:
             payload = (arr * 2147483647.0).round().astype("<i4")
         else:
-            print(f"[WS] Unsupported sampwidth {sampwidth}; skipping frame")
+            self._log(
+                "WS_ERROR",
+                f"unsupported_sampwidth={sampwidth}",
+                level=logging.WARNING,
+            )
             return b""
         raw = payload.tobytes()
         frame_size = channels * sampwidth

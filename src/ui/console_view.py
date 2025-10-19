@@ -16,6 +16,7 @@ class ConsoleState:
     selected_speaker: Optional[int]
     mic_devices: List[DeviceInfo]
     speaker_devices: List[DeviceInfo]
+    record_action: str
     message: Optional[str] = None
 
 
@@ -60,7 +61,7 @@ class ConsoleView:
         print(" | ".join(labels))
 
     def _render_record(self, state: ConsoleState) -> None:
-        print("Press 2 to start/stop recording with the current devices.")
+        print(f"Press 2 to {state.record_action} with the current devices.")
         print(f"Microphone device index: {state.selected_mic}")
         print(f"Speaker device index:    {state.selected_speaker}")
 

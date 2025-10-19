@@ -1,5 +1,6 @@
 import asyncio
 import io
+import time
 import uuid
 import wave
 from typing import Any, Dict, Optional, Tuple
@@ -25,10 +26,13 @@ class AudioSession:
             False  # wrapper: playback.start -> playback.end
         )
         self._final_event_received = False
+        self._last_activity: float = time.monotonic()
+        self._playback_complete_event: Optional[asyncio.Event] = None
         ws._on_receive = self._on_receive
         ws._on_receive_binary = self._on_binary
 
     async def _on_receive(self, msg):
+        self._last_activity = time.monotonic()
         if msg.session_id not in {None, self.session_id}:
             return
         if msg.type == "audio_chunk":
@@ -73,6 +77,7 @@ class AudioSession:
         self._playback_meta = None
         self._pending_playback_files = 0
         self._final_event_received = False
+        self._playback_complete_event = asyncio.Event()
         # Prepare server-side stream if binary protocol is used
         try:
             await self.ws.prepare_stream(
@@ -135,19 +140,38 @@ class AudioSession:
 
         try:
             if run_error is None:
+                poll = 1.0
+                idle_limit = (
+                    float(playback_timeout) if playback_timeout is not None else None
+                )
                 while True:
-                    if playback_timeout is not None:
-                        data = await asyncio.wait_for(
-                            self._queue.get(), timeout=playback_timeout
-                        )
-                    else:
-                        data = await self._queue.get()
+                    try:
+                        data = await asyncio.wait_for(self._queue.get(), timeout=poll)
+                    except asyncio.TimeoutError:
+                        now = time.monotonic()
+                        if self._playback_finished:
+                            break
+                        if (
+                            idle_limit is not None
+                            and (now - self._last_activity) > idle_limit
+                        ):
+                            print(
+                                f"[Session {self.session_id}] playback idle > {idle_limit}s; stopping"
+                            )
+                            break
+                        continue
                     if data is None:
                         break
                     await self.spk.play(data)
                 print(f"[Session {self.session_id}] Completed")
         finally:
             self.spk.spk.stop_output()
+            if (
+                run_error is not None
+                and self._playback_complete_event
+                and not self._playback_complete_event.is_set()
+            ):
+                self._playback_complete_event.set()
 
         if run_error is not None:
             raise run_error
@@ -175,6 +199,7 @@ class AudioSession:
             await asyncio.sleep(0.05)
 
     async def _handle_playback_start(self, msg):
+        print(f"[Session {self.session_id}] playback_file_start received")
         extra = msg.extra or {}
         file_field = extra.get("file")
         params = extra.get("params") if isinstance(extra.get("params"), dict) else {}
@@ -195,9 +220,30 @@ class AudioSession:
             return default
 
         playback_format = str(_first("format", "pcm")).lower()
+        # Try to extract a stable message identifier for ACKs
+        message_id = extra.get("message_id") or extra.get("utterance_id")
+        if not message_id:
+            if isinstance(file_field, dict):
+                message_id = (
+                    file_field.get("file")
+                    or file_field.get("path")
+                    or file_field.get("name")
+                )
+            elif isinstance(file_field, str):
+                message_id = file_field
+        if not message_id:
+            # Fallback to composite id
+            turn_id = extra.get("turn_id") or "turn"
+            idx = extra.get("utterance_index")
+            message_id = f"{turn_id}:{idx if idx is not None else '0'}"
         if playback_format == "wav":
-            self._playback_meta = {"format": "wav", "buffer": bytearray()}
+            self._playback_meta = {
+                "format": "wav",
+                "buffer": bytearray(),
+                "message_id": message_id,
+            }
             self._pending_playback_files += 1
+            print(f"[Session {self.session_id}] Playback format=wav")
             return
         if playback_format != "pcm":
             # Default to PCM if unspecified or unknown to avoid dropping audio
@@ -219,8 +265,12 @@ class AudioSession:
             print("[Session] Unsupported PCM format; skipping playback")
             self._playback_meta = None
             return
+        pcm_meta["message_id"] = message_id
         self._playback_meta = pcm_meta
         self._pending_playback_files += 1
+        print(
+            f"[Session {self.session_id}] Playback format=pcm sr={sample_rate} ch={channels} sw={sampwidth}"
+        )
 
     async def _handle_playback_done(self):
         meta = self._playback_meta
@@ -231,9 +281,15 @@ class AudioSession:
         self._playback_meta = None
         if self._pending_playback_files > 0:
             self._pending_playback_files -= 1
+        print(
+            f"[Session {self.session_id}] playback_file_done (remaining={self._pending_playback_files})"
+        )
+        # Try to send playback ACK after we have likely played queued blocks
+        await self._maybe_send_playback_ack(meta)
         await self._maybe_complete_playback()
 
     async def _on_binary(self, payload: bytes):
+        self._last_activity = time.monotonic()
         meta = self._playback_meta
         if not meta or not payload:
             return
@@ -334,6 +390,63 @@ class AudioSession:
             return
         self._playback_finished = True
         await self._queue.put(None)
+        if self._playback_complete_event and not self._playback_complete_event.is_set():
+            self._playback_complete_event.set()
+
+    async def _maybe_send_playback_ack(self, meta: Dict[str, Any]) -> None:
+        message_id = meta.get("message_id")
+        if not message_id:
+            return
+        # Best-effort: wait briefly for speaker queue to drain before ACK
+        try:
+            await self._await_speaker_drain(timeout=3.0)
+        except Exception:
+            pass
+        try:
+            await self.ws.send_playback_ack(
+                self.session_id, message_id, status="played"
+            )
+        except Exception:
+            # Non-fatal
+            pass
+
+    async def _await_speaker_drain(self, timeout: float = 3.0) -> None:
+        # Poll speaker queue until empty or timeout
+        # SpeakerInterface exposes pending_blocks(); fallback no-op if missing
+        get_pending = getattr(self.spk.spk, "pending_blocks", None)
+        if not callable(get_pending):
+            await asyncio.sleep(0)
+            return
+        deadline = asyncio.get_running_loop().time() + timeout
+        while get_pending() > 0 and asyncio.get_running_loop().time() < deadline:
+            await asyncio.sleep(0.05)
+
+    async def wait_for_playback_completion(
+        self, timeout: Optional[float] = None
+    ) -> bool:
+        """Wait until the playback pipeline has fully completed.
+
+        This is primarily used during shutdown/cleanup to ensure we have
+        received and processed any remaining playback events before the
+        websocket is closed.
+        """
+        event = self._playback_complete_event
+        if event is None or event.is_set():
+            return True
+        awaitable = asyncio.shield(event.wait())
+        if timeout is None:
+            try:
+                await awaitable
+                return True
+            except asyncio.CancelledError:
+                raise
+        else:
+            try:
+                await asyncio.wait_for(awaitable, timeout=timeout)
+                return True
+            except asyncio.TimeoutError:
+                return False
+        return True
 
     @staticmethod
     def _parse_pcm_format(pcm_format: str, sampwidth: int) -> Tuple[bool, str]:

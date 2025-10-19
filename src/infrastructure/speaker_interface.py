@@ -185,6 +185,10 @@ class SpeakerInterface:
             except queue.Empty:
                 return
 
+    def pending_blocks(self) -> int:
+        """Approximate number of audio blocks pending in output queue."""
+        return self._play_queue.qsize()
+
     def _request_stop(self, join_timeout: float) -> None:
         with self._lock:
             self._stop_event.set()

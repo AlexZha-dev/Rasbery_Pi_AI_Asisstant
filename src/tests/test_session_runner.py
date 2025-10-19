@@ -1,6 +1,7 @@
 import asyncio
 import threading
 import time
+from typing import Optional
 
 import pytest
 
@@ -37,6 +38,28 @@ class DummyClient:
 
     async def close(self) -> None:
         self._closed_event.set()
+
+
+class PlaybackAwareSession:
+    def __init__(
+        self,
+        stop_event: asyncio.Event,
+        playback_called: threading.Event,
+    ):
+        self._stop_event = stop_event
+        self._playback_called = playback_called
+
+    async def run_once(self, timeout: float, playback_timeout: float) -> None:
+        try:
+            await self._stop_event.wait()
+            await asyncio.sleep(10)
+        except asyncio.CancelledError:
+            raise
+
+    async def wait_for_playback_completion(self, timeout: Optional[float]) -> bool:
+        self._playback_called.set()
+        await asyncio.sleep(0.2)
+        return False
 
 
 @pytest.mark.asyncio
@@ -128,3 +151,95 @@ async def test_session_runner_stop_before_execute():
     status = runner.get_status()
     assert status.state == "idle"
     assert "stopped" in status.message.lower()
+
+
+@pytest.mark.asyncio
+async def test_session_runner_close_websocket():
+    stop_event = asyncio.Event()
+    closed_event = asyncio.Event()
+
+    def factory():
+        return BlockingSession(stop_event), DummyClient(closed_event)
+
+    runner = SessionRunner(factory, request_stop=lambda: None, join_timeout=1.0)
+    ok, msg = await runner.start()
+    assert ok, msg
+    await async_eventually(
+        lambda: runner.get_status().state == "recording",
+        timeout=2.0,
+        stage="runner start",
+    )
+    ok, msg = await runner.close_websocket()
+    assert ok, msg
+    await async_eventually(
+        lambda: not runner.is_running(), timeout=2.0, stage="runner close"
+    )
+    await asyncio.wait_for(closed_event.wait(), timeout=1.0)
+    status = runner.get_status()
+    assert status.state == "idle"
+    assert "closed" in status.message.lower()
+
+
+@pytest.mark.asyncio
+async def test_session_runner_stop_without_waiting_allows_close():
+    stop_event = asyncio.Event()
+    closed_event = asyncio.Event()
+    stop_called = threading.Event()
+
+    def factory():
+        return BlockingSession(stop_event), DummyClient(closed_event)
+
+    def request_stop():
+        stop_called.set()
+        # Intentionally do not set stop_event to keep the session running
+
+    runner = SessionRunner(factory, request_stop=request_stop, join_timeout=1.0)
+    ok, msg = await runner.start()
+    assert ok, msg
+    await async_eventually(
+        lambda: runner.get_status().state == "recording",
+        timeout=2.0,
+        stage="runner start",
+    )
+    ok, msg = await runner.stop(wait_for_completion=False)
+    assert ok
+    assert "requested" in msg.lower()
+    await async_eventually(stop_called.is_set, timeout=1.0, stage="stop callback")
+    assert runner.is_running()
+    ok, msg = await runner.close_websocket()
+    assert ok, msg
+    await async_eventually(
+        lambda: not runner.is_running(), timeout=2.0, stage="runner close"
+    )
+    await asyncio.wait_for(closed_event.wait(), timeout=1.0)
+    status = runner.get_status()
+    assert status.state == "idle"
+    assert "closed" in status.message.lower()
+
+
+@pytest.mark.asyncio
+async def test_close_websocket_skips_playback_wait_on_console_close():
+    stop_event = asyncio.Event()
+    closed_event = asyncio.Event()
+    playback_called = threading.Event()
+
+    def factory():
+        session = PlaybackAwareSession(stop_event, playback_called)
+        return session, DummyClient(closed_event)
+
+    runner = SessionRunner(factory, request_stop=lambda: None, join_timeout=1.0)
+    ok, msg = await runner.start()
+    assert ok, msg
+    await async_eventually(
+        lambda: runner.get_status().state == "recording",
+        timeout=2.0,
+        stage="runner start",
+    )
+
+    ok, msg = await runner.close_websocket()
+    assert ok, msg
+    await async_eventually(
+        lambda: not runner.is_running(), timeout=2.0, stage="runner close"
+    )
+    await asyncio.wait_for(closed_event.wait(), timeout=1.0)
+    assert not playback_called.is_set()

@@ -4,7 +4,7 @@ import asyncio
 import time
 from dataclasses import dataclass
 from pathlib import Path
-from typing import Callable, Optional, Tuple
+from typing import Callable, Literal, Optional, Tuple
 
 from application.session_runner import RunnerStatus, SessionRunner
 from config.preferences import load_preferences, save_preferences
@@ -20,6 +20,9 @@ InputProvider = Callable[[str], str]
 @dataclass
 class ControllerConfig:
     tabs: Tuple[str, ...] = ("Record", "Microphone", "Speaker")
+
+
+RecordState = Literal["ready", "recording", "await_close"]
 
 
 class ConsoleController:
@@ -55,6 +58,9 @@ class ConsoleController:
         self._force_refresh = False
         self._selected_mic = self._initialise_device("mic_device", True)
         self._selected_speaker = self._initialise_device("speaker_device", False)
+        self._record_state: RecordState = (
+            "recording" if self._runner.is_running() else "ready"
+        )
 
     async def run(self) -> None:
         running = True
@@ -101,6 +107,9 @@ class ConsoleController:
         if action == "2":
             await self._handle_accept()
             return True
+        if action == "c":
+            await self._handle_close_websocket()
+            return True
         self._message = f"Unknown command: {command}"
         return True
 
@@ -114,32 +123,55 @@ class ConsoleController:
             await self._choose_device(is_input=False)
 
     async def _toggle_session(self) -> None:
-        if self._runner.is_running():
-            await self._stop_recording()
-        else:
+        self._sync_record_state()
+        if self._record_state == "ready":
             await self._start_recording()
+            return
+        if self._record_state == "recording":
+            await self._stop_recording()
+            return
+        await self._handle_close_websocket()
 
     async def _start_recording(self) -> None:
         success, msg = await self._runner.start()
-        self._message = msg if success else f"Session error: {msg}"
+        if success:
+            self._record_state = "recording"
+            self._message = msg
+        else:
+            self._record_state = "ready"
+            self._message = f"Session error: {msg}"
 
     async def _stop_recording(self) -> None:
-        success, msg = await self._runner.stop()
+        success, msg = await self._runner.stop(wait_for_completion=False)
         if success:
-            await self._wait_for_runner_idle()
-            self._message = "Session stopped"
+            self._record_state = "await_close"
+            self._message = "Recording stopped; press 2 again to end the session."
             return
         lowered = msg.lower()
         if "already requested" in lowered:
-            completed = await self._wait_for_runner_idle()
-            self._message = (
-                "Session stopped" if completed else "Session stop in progress..."
-            )
+            self._record_state = "await_close"
+            self._message = "Stop already requested; press 2 again to end the session."
+            return
+        if "playback still running" in lowered:
+            self._record_state = "await_close"
+            self._message = "Playback still running; waiting to finish..."
             return
         if "not running" in lowered:
+            self._record_state = "ready"
             self._message = "Session is not running"
             return
+        self._record_state = "ready"
         self._message = f"Session error: {msg}"
+
+    async def _handle_close_websocket(self) -> bool:
+        success, msg = await self._runner.close_websocket()
+        if success:
+            await self._wait_for_runner_idle()
+        self._message = msg
+        lowered = msg.lower() if msg else ""
+        if success or "not running" in lowered or "already requested" in lowered:
+            self._record_state = "ready"
+        return success
 
     async def _choose_device(self, *, is_input: bool) -> None:
         prompt = (
@@ -193,6 +225,7 @@ class ConsoleController:
             self._message = f"Failed to set speaker: {exc}"
 
     def _build_state(self) -> ConsoleState:
+        self._sync_record_state()
         status = self._runner.get_status()
         return ConsoleState(
             tabs=self._tabs,
@@ -204,6 +237,7 @@ class ConsoleController:
             mic_devices=self._current_snapshot.input_devices,
             speaker_devices=self._current_snapshot.output_devices,
             message=self._resolved_message(status),
+            record_action=self._record_action_label(),
         )
 
     def _resolved_message(self, status: RunnerStatus) -> Optional[str]:
@@ -263,6 +297,20 @@ class ConsoleController:
             self._current_snapshot = self._registry.refresh()
             self._last_refresh = now
             self._force_refresh = False
+
+    def _sync_record_state(self) -> None:
+        if (
+            self._record_state in {"recording", "await_close"}
+            and not self._runner.is_running()
+        ):
+            self._record_state = "ready"
+
+    def _record_action_label(self) -> str:
+        if self._record_state == "ready":
+            return "start recording"
+        if self._record_state == "recording":
+            return "stop recording"
+        return "close the session"
 
     async def _prompt(self, prompt: str) -> str:
         loop = asyncio.get_running_loop()

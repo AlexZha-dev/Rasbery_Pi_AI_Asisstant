@@ -18,7 +18,7 @@ async def main():
     session = AudioSession(ws_client, mic_adapter, spk_adapter)
     await session.run_once(timeout=5, playback_timeout=30.0)
 
-    await ws_client.close()
+    await ws_client.close(reason="main_shutdown", trigger="main")
 
 
 if __name__ == "__main__":

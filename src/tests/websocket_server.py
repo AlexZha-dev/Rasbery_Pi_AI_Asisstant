@@ -21,6 +21,7 @@ import websockets
 # Сессии: session_id -> список numpy фреймов (float32, shape [N, C])
 sessions: Dict[str, List[np.ndarray]] = {}
 start_params: Dict[str, Dict[str, int]] = {}
+playback_acks: Dict[str, List[Dict[str, str]]] = {}
 
 # Папка для сохранения файлов
 OUTPUT_DIR = os.path.join(os.path.dirname(__file__), "outputs")
@@ -36,6 +37,7 @@ async def handle_client(ws):
     protocol_mode = "json"
 
     current_session: Optional[str] = None
+    last_session_id: Optional[str] = None
     sample_rate = 16000
     channels = 1
     sampwidth = 2
@@ -70,6 +72,7 @@ async def handle_client(ws):
 
             if msg_type == "start":
                 current_session = session_id
+                last_session_id = current_session
                 sample_rate = int(data.get("sample_rate", sample_rate))
                 channels = int(data.get("channels", channels))
                 sampwidth = int(data.get("sampwidth", sampwidth))
@@ -123,6 +126,7 @@ async def handle_client(ws):
                 sid = session_id or current_session
                 if not sid:
                     continue
+                last_session_id = sid
                 print(f"[SERVER] End session {sid}")
 
                 frames = sessions.get(sid, [])
@@ -275,6 +279,25 @@ async def handle_client(ws):
                 if sid in sessions:
                     del sessions[sid]
                 current_session = None
+                continue
+
+            if msg_type == "playback_ack":
+                sid = (
+                    data.get("session_id")
+                    or current_session
+                    or last_session_id
+                    or "unknown"
+                )
+                payload = {
+                    "type": "playback_ack",
+                    "message_id": data.get("message_id"),
+                    "status": data.get("status"),
+                }
+                playback_acks.setdefault(sid, []).append(payload)
+                print(
+                    f"[SERVER] Received playback_ack sid={sid} "
+                    f"message_id={payload['message_id']} status={payload['status']}"
+                )
                 continue
 
             if msg_type == "playback":

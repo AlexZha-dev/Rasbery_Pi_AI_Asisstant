@@ -13,7 +13,13 @@ import config.audio_config as audio_config
 from application.audio_session import AudioSession
 from infrastructure.sounds_adapters import MicrophoneAsyncAdapter, SpeakerAsyncAdapter
 from infrastructure.websocket_client import AudioWebSocketClient
-from tests.websocket_server import OUTPUT_DIR, handle_client, sessions, start_params
+from tests.websocket_server import (
+    OUTPUT_DIR,
+    handle_client,
+    playback_acks,
+    sessions,
+    start_params,
+)
 
 os.environ.setdefault("AUDIO_WS_URL", "ws://127.0.0.1:8765")
 
@@ -86,6 +92,7 @@ async def audio_test_server(monkeypatch, mode):
         await server.wait_closed()
         sessions.clear()
         start_params.clear()
+        playback_acks.clear()
         if target.exists():
             target.unlink()
 
@@ -118,8 +125,22 @@ async def test_audio_session_roundtrip(audio_test_server, mode):
     session.session_id = "test-session"
 
     await run_with_timeout(session.run_once(timeout=0.2), 5.0, "session run")
-    await run_with_timeout(ws_client.close(), 2.0, "websocket close")
+    await run_with_timeout(
+        ws_client.close(reason="test_teardown", trigger="pytest.teardown"),
+        2.0,
+        "websocket close",
+    )
     assert ws_client.closed_by_server is False
+
+    if mode == "binary":
+        ack_list = playback_acks.get("test-session")
+        assert ack_list, "Expected playback acknowledgment for session 'test-session'"
+        assert any(
+            ack["type"] == "playback_ack"
+            and ack["message_id"] == "utt-1"
+            and ack["status"] == "played"
+            for ack in ack_list
+        )
 
     assert spk.frames, "Speaker did not receive any frames"
     combined = np.concatenate(spk.frames, axis=0)
