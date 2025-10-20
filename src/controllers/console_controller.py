@@ -145,7 +145,11 @@ class ConsoleController:
         success, msg = await self._runner.stop(wait_for_completion=False)
         if success:
             self._record_state = "await_close"
-            self._message = "Recording stopped; press 2 again to end the session."
+            lowered = (msg or "").lower()
+            if "stop requested" in lowered or not msg:
+                self._message = "Recording stopped; press 2 again to end the session."
+            else:
+                self._message = msg
             return
         lowered = msg.lower()
         if "already requested" in lowered:

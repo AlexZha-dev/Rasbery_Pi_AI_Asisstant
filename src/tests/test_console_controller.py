@@ -42,7 +42,7 @@ class FakeRunner:
         self._status = RunnerStatus("recording", "Streaming audio (press 2 to stop)")
         return True, "Session starting"
 
-    async def stop(self):
+    async def stop(self, *, wait_for_completion: bool = True):
         if not self.running:
             return False, "Session is not running"
         self.running = False
