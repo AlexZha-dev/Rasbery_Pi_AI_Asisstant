@@ -31,6 +31,28 @@ class AudioSession:
         ws._on_receive = self._on_receive
         ws._on_receive_binary = self._on_binary
 
+    # CHANGED: ensure a consistent 16 kHz processing rate across playback paths
+    # by providing a small linear resampler used when server-provided audio
+    # differs from 16000 Hz. This keeps downstream speaker assumptions intact.
+    def _resample(
+        self, arr: np.ndarray, src_rate: float, dst_rate: float
+    ) -> np.ndarray:
+        if not isinstance(arr, np.ndarray) or arr.size == 0:
+            return arr
+        if src_rate == dst_rate:
+            return arr
+        ratio = float(dst_rate) / float(src_rate)
+        dst_len = max(1, int(round(arr.shape[0] * ratio)))
+        orig_positions = np.linspace(0.0, 1.0, arr.shape[0], endpoint=False)
+        new_positions = np.linspace(0.0, 1.0, dst_len, endpoint=False)
+        # Ensure 2D (frames, channels)
+        if arr.ndim == 1:
+            arr = arr.reshape(-1, 1)
+        resampled = np.empty((dst_len, arr.shape[1]), dtype=np.float32)
+        for idx in range(arr.shape[1]):
+            resampled[:, idx] = np.interp(new_positions, orig_positions, arr[:, idx])
+        return resampled.astype(np.float32)
+
     async def _on_receive(self, msg):
         self._last_activity = time.monotonic()
         if msg.session_id not in {None, self.session_id}:
@@ -299,6 +321,10 @@ class AudioSession:
             return
         arr = self._decode_pcm_bytes(payload, meta)
         if arr is not None:
+            # CHANGED: enforce 16 kHz processing; resample incoming PCM if needed
+            src_rate = int(meta.get("sample_rate", 16000))
+            if src_rate != 16000:
+                arr = self._resample(arr, src_rate, 16000)
             await self._queue.put(arr)
 
     def _build_pcm_meta(
@@ -350,6 +376,9 @@ class AudioSession:
             return
         arr = self._decode_pcm_bytes(raw, pcm_meta)
         if arr is not None:
+            # CHANGED: enforce 16 kHz processing; resample WAV payloads if needed
+            if int(sample_rate) != 16000:
+                arr = self._resample(arr, int(sample_rate), 16000)
             await self._queue.put(arr)
 
     def _decode_pcm_bytes(
