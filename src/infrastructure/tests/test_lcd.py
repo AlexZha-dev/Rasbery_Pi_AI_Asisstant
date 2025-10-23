@@ -114,12 +114,14 @@ def test_scroll_creates_expected_windows():
     payload = "This message is definitely longer than thirty two characters."
     lcd.display_text_with_scroll(payload, color="info", delay=0.0)
 
-    expected_windows = len(payload) + LCDDisplay.COLS - (
-        LCDDisplay.COLS * LCDDisplay.ROWS
-    ) + 1
+    expected_windows = (
+        len(payload) + LCDDisplay.COLS - (LCDDisplay.COLS * LCDDisplay.ROWS) + 1
+    )
 
     assert len(bus.windows) == expected_windows
-    assert all(len(window) == LCDDisplay.COLS * LCDDisplay.ROWS for window in bus.windows)
+    assert all(
+        len(window) == LCDDisplay.COLS * LCDDisplay.ROWS for window in bus.windows
+    )
     assert bus.rgb == (128, 0, 255)
 
 

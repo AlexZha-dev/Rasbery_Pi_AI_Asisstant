@@ -14,6 +14,7 @@ except ImportError as import_error:  # pragma: no cover - dependency missing at 
 else:
     _LCD_IMPORT_ERROR: Optional[Exception] = None
 
+
 class LCDView:
     """View-controller that mirrors session state on a 16x2 RGB LCD panel."""
 

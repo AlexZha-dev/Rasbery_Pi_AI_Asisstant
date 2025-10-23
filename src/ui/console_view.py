@@ -84,3 +84,27 @@ class ConsoleView:
             name = (dev.name[:27] + "...") if len(dev.name) > 30 else dev.name
             print(f"{dev.index:>4}  {name:30}  {channels:>8}  {current_marker}")
         print("Press 2 and enter a device index to select.")
+
+    def show_state(
+        self,
+        state: str,
+        message: Optional[str] = None,
+        *,
+        tabs: Optional[List[str]] = None,
+        record_action: str = "record",
+    ) -> None:
+        summary = message or state.replace("_", " ").title()
+        view_tabs = tabs or ["Record", "Microphone", "Speaker"]
+        placeholder = ConsoleState(
+            tabs=view_tabs,
+            active_tab=0,
+            session_state=state,
+            session_message=summary,
+            selected_mic=None,
+            selected_speaker=None,
+            mic_devices=[],
+            speaker_devices=[],
+            record_action=record_action,
+            message=None,
+        )
+        self.render(placeholder)
