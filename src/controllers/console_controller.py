@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import asyncio
+import contextlib
 import time
 from dataclasses import dataclass
 from pathlib import Path
@@ -13,6 +14,7 @@ from infrastructure.device_registry import DeviceRegistry, DeviceSnapshot
 from infrastructure.microphone_interface import MicrophoneInterface
 from infrastructure.speaker_interface import SpeakerInterface
 from ui.console_view import ConsoleState, ConsoleView
+from ui.lcd_view import LCDView
 
 InputProvider = Callable[[str], str]
 
@@ -35,6 +37,7 @@ class ConsoleController:
         registry: DeviceRegistry,
         session_runner: SessionRunner,
         view: Optional[ConsoleView] = None,
+        lcd_view: Optional[LCDView] = None,
         input_provider: InputProvider = input,
         preferences_path: Optional[Path] = None,
         config: ControllerConfig = ControllerConfig(),
@@ -44,6 +47,10 @@ class ConsoleController:
         self._registry = registry
         self._runner = session_runner
         self._view = view or ConsoleView()
+        self._lcd_view = lcd_view
+        self._lcd_state: Optional[str] = None
+        self._lcd_override: Optional[str] = None
+        self._lcd_task: Optional[asyncio.Task] = None
         self._input = input_provider
         self._prefs_path = preferences_path
         self._config = config
@@ -61,14 +68,19 @@ class ConsoleController:
         self._record_state: RecordState = (
             "recording" if self._runner.is_running() else "ready"
         )
+        self._update_lcd_state(force=True)
 
     async def run(self) -> None:
         running = True
+        if self._lcd_view is not None and self._lcd_task is None:
+            loop = asyncio.get_running_loop()
+            self._lcd_task = loop.create_task(self._lcd_heartbeat())
         try:
             while running:
                 self._maybe_refresh_devices()
                 state = self._build_state()
                 self._view.render(state)
+                self._update_lcd_state()
                 try:
                     print("[Console] Awaiting command...")
                     command = await self._prompt("Command: ")
@@ -81,6 +93,12 @@ class ConsoleController:
         finally:
             if self._runner.is_running():
                 await self._runner.stop()
+            self._update_lcd_state(force=True)
+            if self._lcd_task is not None:
+                self._lcd_task.cancel()
+                with contextlib.suppress(asyncio.CancelledError):
+                    await self._lcd_task
+                self._lcd_task = None
 
     def get_state(self) -> ConsoleState:
         self._maybe_refresh_devices()
@@ -137,9 +155,11 @@ class ConsoleController:
         if success:
             self._record_state = "recording"
             self._message = msg
+            self._queue_lcd_state("recording_active")
         else:
             self._record_state = "ready"
             self._message = f"Session error: {msg}"
+            self._queue_lcd_state("error")
 
     async def _stop_recording(self) -> None:
         success, msg = await self._runner.stop(wait_for_completion=False)
@@ -150,22 +170,27 @@ class ConsoleController:
                 self._message = "Recording stopped; press 2 again to end the session."
             else:
                 self._message = msg
+            self._queue_lcd_state("sending_success")
             return
-        lowered = msg.lower()
+        lowered = (msg or "").lower()
         if "already requested" in lowered:
             self._record_state = "await_close"
             self._message = "Stop already requested; press 2 again to end the session."
+            self._queue_lcd_state("waiting_for_answer")
             return
         if "playback still running" in lowered:
             self._record_state = "await_close"
             self._message = "Playback still running; waiting to finish..."
+            self._queue_lcd_state("waiting_for_answer")
             return
         if "not running" in lowered:
             self._record_state = "ready"
             self._message = "Session is not running"
+            self._queue_lcd_state("answer_stopped")
             return
         self._record_state = "ready"
         self._message = f"Session error: {msg}"
+        self._queue_lcd_state("error")
 
     async def _handle_close_websocket(self) -> bool:
         success, msg = await self._runner.close_websocket()
@@ -175,6 +200,15 @@ class ConsoleController:
         lowered = msg.lower() if msg else ""
         if success or "not running" in lowered or "already requested" in lowered:
             self._record_state = "ready"
+        if success:
+            self._queue_lcd_state("answer_stopped")
+        else:
+            if "not running" in lowered:
+                self._queue_lcd_state("answer_stopped")
+            elif "already requested" in lowered:
+                self._queue_lcd_state("waiting_for_answer")
+            else:
+                self._queue_lcd_state("error")
         return success
 
     async def _choose_device(self, *, is_input: bool) -> None:
@@ -329,3 +363,54 @@ class ConsoleController:
         while self._runner.is_running() and loop.time() < deadline:
             await asyncio.sleep(0.1)
         return not self._runner.is_running()
+
+    def _queue_lcd_state(self, state: str) -> None:
+        if self._lcd_view is None:
+            return
+        self._lcd_override = state
+        self._update_lcd_state(force=True)
+
+    def _update_lcd_state(self, *, force: bool = False) -> None:
+        if self._lcd_view is None:
+            return
+        if self._lcd_override is not None:
+            state = self._lcd_override
+            self._lcd_override = None
+        else:
+            state = self._determine_lcd_state()
+        if force or state != self._lcd_state:
+            self._lcd_view.show_state(state)
+            self._lcd_state = state
+
+    def _determine_lcd_state(self) -> str:
+        status = self._runner.get_status()
+        if status.state == "error":
+            return "error"
+        if self._speaker.is_playing:
+            return "answer_playing"
+        if status.state == "recording" or self._record_state == "recording":
+            return "recording_active"
+        if status.state == "stopping":
+            lowered = (status.message or "").lower()
+            if "playback still" in lowered or "waiting" in lowered:
+                return "waiting_for_answer"
+            return "sending_success"
+        if self._record_state == "await_close":
+            return "waiting_for_answer"
+        if status.state == "connecting":
+            return "waiting_for_answer"
+        if status.state == "idle":
+            lowered = (status.message or "").lower()
+            if "completed" in lowered:
+                return "answer_ended"
+            if "stopped" in lowered:
+                return "answer_stopped"
+        return "waiting_for_recording"
+
+    async def _lcd_heartbeat(self) -> None:
+        try:
+            while True:
+                await asyncio.sleep(0.5)
+                self._update_lcd_state()
+        except asyncio.CancelledError:  # pragma: no cover - cancellation path
+            pass

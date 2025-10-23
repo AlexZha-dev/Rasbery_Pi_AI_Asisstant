@@ -39,6 +39,27 @@ def test_unknown_state_logs_warning(caplog: pytest.LogCaptureFixture):
     assert color == "info"
 
 
+@pytest.mark.parametrize(
+    ("state", "expected"),
+    [
+        ("waiting_for_recording", "Waiting to start recording"),
+        ("recording_active", "I am recording"),
+        ("sending_success", "Sending is successful"),
+        ("waiting_for_answer", "Waiting for an answer"),
+        ("answer_playing", "Answer is being played"),
+        ("answer_stopped", "Stop"),
+        ("answer_ended", "End"),
+    ],
+)
+def test_specific_states_render_expected_messages(state, expected):
+    dummy = DummyLCD()
+    view = LCDView(lcd=dummy)
+
+    view.show_state(state)
+
+    assert dummy.display_calls[-1][0] == expected
+
+
 def test_clear_invokes_lcd_clear():
     dummy = DummyLCD()
     view = LCDView(lcd=dummy)

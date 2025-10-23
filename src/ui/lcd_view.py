@@ -24,6 +24,13 @@ class LCDView:
         "waiting_for_response": ("Waiting for response...", "warning"),
         "response_received": ("Response received!", "success"),
         "error": ("Error occurred!", "error"),
+        "waiting_for_recording": ("Waiting to start recording", "info"),
+        "recording_active": ("I am recording", "success"),
+        "sending_success": ("Sending is successful", "success"),
+        "waiting_for_answer": ("Waiting for an answer", "warning"),
+        "answer_playing": ("Answer is being played", "info"),
+        "answer_stopped": ("Stop", "warning"),
+        "answer_ended": ("End", "success"),
     }
 
     def __init__(

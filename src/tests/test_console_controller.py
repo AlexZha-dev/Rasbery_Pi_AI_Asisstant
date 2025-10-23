@@ -22,9 +22,14 @@ class StubMicrophone:
 class StubSpeaker:
     def __init__(self):
         self.device = None
+        self._is_playing = False
 
     def set_output_device(self, index: int):
         self.device = index
+
+    @property
+    def is_playing(self):
+        return self._is_playing
 
 
 class FakeRunner:
