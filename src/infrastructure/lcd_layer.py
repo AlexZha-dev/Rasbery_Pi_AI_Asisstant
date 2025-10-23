@@ -1,108 +1,169 @@
-import asyncio
+from __future__ import annotations
 
-from exceptions.lcd_exceptions import (
-    LCDCoordinateError,
-    LCDException,
-    LCDRowError,
-    LCDScrollDirectionError,
-)
+import time
+from typing import Dict, Optional, Tuple
+
+from smbus2 import SMBus
+
+from exceptions.lcd_exceptions import LCDException, LCDRowError
 
 
 class LCDDisplay:
-    def __init__(self, rows: int = 2, cols: int = 16):
-        self.rows = rows
-        self.cols = cols
-        self.buffer = [" " * cols for _ in range(rows)]
-        self.backlight_color = "white"
+    """Driver for 16x2 RGB backlit LCD modules that use the Grove I2C protocol."""
 
-    def clear(self):
-        """Очистка дисплея"""
-        self.buffer = [" " * self.cols for _ in range(self.rows)]
-        self._render()
+    DISPLAY_TEXT_ADDR = 0x3E
+    DISPLAY_RGB_ADDR = 0x62
+    COLS = 16
+    ROWS = 2
 
-    def set_backlight(self, color: str):
-        """Установка цвета подсветки"""
+    _COLOR_MAP: Dict[str, Tuple[int, int, int]] = {
+        "error": (255, 0, 0),
+        "warning": (255, 255, 0),
+        "success": (0, 255, 0),
+        "info": (128, 0, 255),
+    }
+
+    def __init__(self, bus: Optional[SMBus] = None) -> None:
+        """
+        Create an LCD driver and power up the controller.
+
+        By default SMBus(1) is opened which is the I2C bus exposed on Raspberry Pi
+        headers. Tests may pass a fake bus implementation via the *bus* argument.
+        """
+        self._bus = bus or SMBus(1)
+        self._init_controller()
+
+    def display_text(self, text: str, line: int = 0, color: str = "success") -> None:
+        """
+        Render *text* starting at *line* (0 or 1). The backlight is set according to
+        the named *color*. Text longer than 16 characters continues on the following
+        line. Anything past the physical screen (32 characters total) is discarded.
+        """
+        if line not in (0, 1):
+            raise LCDRowError(f"Line index must be 0 or 1, got {line}")
+
+        safe_text = (text or "").replace("\r", " ").replace("\n", " ")
+        self._apply_color(color)
+
+        visible_chars = self.COLS * (self.ROWS - line)
+        truncated = safe_text[:visible_chars]
+
+        # Pad to full lines so stale characters are not left on screen.
+        padded = truncated.ljust(self.COLS * (self.ROWS - line))
+
         try:
-            if not isinstance(color, str):
-                raise ValueError("Цвет должен быть строкой")
-            self.backlight_color = color
-            print(f"[LCD] Подсветка установлена: {color}")
-        except Exception as e:
-            raise LCDException(f"Ошибка установки подсветки: {e}")
+            for offset in range(self.ROWS - line):
+                start = offset * self.COLS
+                chunk = padded[start : start + self.COLS]
+                if line + offset >= self.ROWS:
+                    break
 
-    def write_char(self, row: int, col: int, char: str):
-        """Пишет один символ по координатам"""
+                ddram_address = 0x80 if line + offset == 0 else 0xC0
+                self._text_command(ddram_address)
+                for char in chunk:
+                    self._write_char(char)
+        except OSError as exc:
+            raise LCDException(f"Failed to render text: {exc}") from exc
+
+    def display_text_with_scroll(
+        self, text: str, color: str = "info", delay: float = 0.3
+    ) -> None:
+        """
+        Show *text* and scroll it horizontally when the payload exceeds 32 symbols.
+        The marquee moves left with *delay* seconds between shifts.
+        """
+        safe_text = (text or "").replace("\r", " ").replace("\n", " ")
+        self._apply_color(color)
+
+        window_size = self.COLS * self.ROWS
+        if len(safe_text) <= window_size:
+            self.display_text(safe_text, line=0, color=color)
+            return
+
+        # Keep a trailing gap so the final characters scroll fully off screen.
+        padded = safe_text + " " * self.COLS
+
         try:
-            if not (0 <= row < self.rows and 0 <= col < self.cols):
-                raise LCDCoordinateError(
-                    f"Недопустимые координаты row={row}, col={col}"
-                )
+            for index in range(len(padded) - window_size + 1):
+                window = padded[index : index + window_size]
+                self._write_window(window)
+                time.sleep(max(delay, 0.0))
+        except OSError as exc:
+            raise LCDException(f"Failed to scroll text: {exc}") from exc
 
-            if not char or not isinstance(char, str):
-                raise ValueError("char должен быть непустой строкой")
-
-            line = list(self.buffer[row])
-            line[col] = char[0]
-            self.buffer[row] = "".join(line)
-            self._render()
-
-        except Exception as e:
-            raise LCDException(f"Ошибка при записи символа: {e}")
-
-    def write_line(self, row: int, text: str):
-        """Пишет строку на выбранную строку"""
+    def clear(self) -> None:
+        """Clear both lines of the display."""
         try:
-            if not (0 <= row < self.rows):
-                raise LCDRowError(f"Неверная строка: {row}")
-            if not isinstance(text, str):
-                raise ValueError("text должен быть строкой")
+            self._text_command(0x01)
+            time.sleep(0.002)
+        except OSError as exc:
+            raise LCDException(f"Failed to clear LCD: {exc}") from exc
 
-            text = text[: self.cols].ljust(self.cols)
-            self.buffer[row] = text
-            self._render()
-        except Exception as e:
-            raise LCDException(f"Ошибка при записи строки: {e}")
+    def close(self) -> None:
+        """Release the underlying SMBus handle."""
+        if self._bus is not None:
+            try:
+                self._bus.close()
+            finally:
+                self._bus = None
 
-    async def write_scrolling(self, text: str, row: int, delay: float = 0.3):
-        """Асинхронно прокручивает длинный текст"""
+    def _init_controller(self) -> None:
+        """Send the standard Grove LCD power-up sequence."""
+        self._text_command(0x01)  # clear
+        time.sleep(0.002)
+        self._text_command(0x08 | 0x04)  # display on, no cursor
+        self._text_command(0x28)  # 2 lines, 5x8 font
+        self._set_rgb(0, 255, 0)
+
+    def _apply_color(self, name: str) -> None:
+        """Translate a symbolic color name into RGB values."""
         try:
-            if not (0 <= row < self.rows):
-                raise LCDRowError(f"Неверная строка: {row}")
-            if not isinstance(text, str):
-                raise ValueError("text должен быть строкой")
+            rgb = self._COLOR_MAP[name.lower()]
+        except KeyError as exc:
+            raise LCDException(f"Unsupported color keyword: {name}") from exc
+        self._set_rgb(*rgb)
 
-            if len(text) <= self.cols:
-                self.write_line(row, text)
-                return
+    def _write_window(self, payload: str) -> None:
+        """Write exactly 32 characters across both display lines."""
+        upper = payload[: self.COLS].ljust(self.COLS)
+        lower = payload[self.COLS : self.COLS * 2].ljust(self.COLS)
 
-            for i in range(len(text) - self.cols + 1):
-                self.buffer[row] = text[i : i + self.cols]
-                self._render()
-                await asyncio.sleep(delay)
+        self._text_command(0x80)
+        for char in upper:
+            self._write_char(char)
 
-        except Exception as e:
-            raise LCDException(f"Ошибка при прокрутке текста: {e}")
+        self._text_command(0xC0)
+        for char in lower:
+            self._write_char(char)
 
-    def scroll(self, direction: str = "up"):
-        """Прокручивает дисплей вверх/вниз"""
-        try:
-            if direction == "up":
-                self.buffer.pop(0)
-                self.buffer.append(" " * self.cols)
-            elif direction == "down":
-                self.buffer.pop()
-                self.buffer.insert(0, " " * self.cols)
-            else:
-                raise LCDScrollDirectionError(f"Неверное направление: {direction}")
+    def _set_rgb(self, red: int, green: int, blue: int) -> None:
+        """Program the RGB backlight driver."""
+        self._bus.write_byte_data(self.DISPLAY_RGB_ADDR, 0x00, 0x00)
+        self._bus.write_byte_data(self.DISPLAY_RGB_ADDR, 0x01, 0x00)
+        self._bus.write_byte_data(self.DISPLAY_RGB_ADDR, 0x08, 0xAA)
+        self._bus.write_byte_data(self.DISPLAY_RGB_ADDR, 0x04, red & 0xFF)
+        self._bus.write_byte_data(self.DISPLAY_RGB_ADDR, 0x03, green & 0xFF)
+        self._bus.write_byte_data(self.DISPLAY_RGB_ADDR, 0x02, blue & 0xFF)
 
-            self._render()
-        except Exception as e:
-            raise LCDException(f"Ошибка при прокрутке: {e}")
+    def _text_command(self, command: int) -> None:
+        """Send a command to the LCD controller."""
+        self._bus.write_byte_data(self.DISPLAY_TEXT_ADDR, 0x80, command & 0xFF)
 
-    def _render(self):
-        """Отображает текущее состояние дисплея"""
-        print("\n" + "=" * (self.cols + 4))
-        print(f" LCD (подсветка: {self.backlight_color})")
-        for line in self.buffer:
-            print(f"| {line} |")
-        print("=" * (self.cols + 4) + "\n")
+    def _write_char(self, char: str) -> None:
+        """Write a single character to the current DDRAM position."""
+        encoded = ord(char) if char else 0x20
+        self._bus.write_byte_data(self.DISPLAY_TEXT_ADDR, 0x40, encoded & 0xFF)
+
+
+if __name__ == "__main__":
+    lcd = LCDDisplay()
+    try:
+        lcd.display_text("System ready", line=0, color="success")
+        time.sleep(2)
+        lcd.display_text_with_scroll(
+            "Raspberry Pi LCD demo - scrolling text showcase.", color="info", delay=0.2
+        )
+        time.sleep(2)
+    finally:
+        lcd.clear()
+        lcd.close()
