@@ -49,7 +49,9 @@ class ConsoleController:
         self._view = view or ConsoleView()
         self._lcd_view = lcd_view
         self._lcd_state: Optional[str] = None
-        self._lcd_override: Optional[str] = None
+        self._lcd_override_state: Optional[str] = None
+        self._lcd_override_until: float = 0.0
+        self._lcd_last_session_state: Optional[str] = None
         self._lcd_task: Optional[asyncio.Task] = None
         self._input = input_provider
         self._prefs_path = preferences_path
@@ -155,7 +157,7 @@ class ConsoleController:
         if success:
             self._record_state = "recording"
             self._message = msg
-            self._queue_lcd_state("recording_active")
+            self._queue_lcd_state("recording_active", hold_for=1.0)
         else:
             self._record_state = "ready"
             self._message = f"Session error: {msg}"
@@ -170,23 +172,23 @@ class ConsoleController:
                 self._message = "Recording stopped; press 2 again to end the session."
             else:
                 self._message = msg
-            self._queue_lcd_state("sending_success")
+            self._queue_lcd_state("sending_success", hold_for=1.0)
             return
         lowered = (msg or "").lower()
         if "already requested" in lowered:
             self._record_state = "await_close"
             self._message = "Stop already requested; press 2 again to end the session."
-            self._queue_lcd_state("waiting_for_answer")
+            self._queue_lcd_state("waiting_for_answer", hold_for=1.0)
             return
         if "playback still running" in lowered:
             self._record_state = "await_close"
             self._message = "Playback still running; waiting to finish..."
-            self._queue_lcd_state("waiting_for_answer")
+            self._queue_lcd_state("waiting_for_answer", hold_for=1.0)
             return
         if "not running" in lowered:
             self._record_state = "ready"
             self._message = "Session is not running"
-            self._queue_lcd_state("answer_stopped")
+            self._queue_lcd_state("answer_stopped", hold_for=2.0)
             return
         self._record_state = "ready"
         self._message = f"Session error: {msg}"
@@ -201,12 +203,12 @@ class ConsoleController:
         if success or "not running" in lowered or "already requested" in lowered:
             self._record_state = "ready"
         if success:
-            self._queue_lcd_state("answer_stopped")
+            self._queue_lcd_state("answer_stopped", hold_for=2.0)
         else:
             if "not running" in lowered:
-                self._queue_lcd_state("answer_stopped")
+                self._queue_lcd_state("answer_stopped", hold_for=2.0)
             elif "already requested" in lowered:
-                self._queue_lcd_state("waiting_for_answer")
+                self._queue_lcd_state("waiting_for_answer", hold_for=1.0)
             else:
                 self._queue_lcd_state("error")
         return success
@@ -364,46 +366,64 @@ class ConsoleController:
             await asyncio.sleep(0.1)
         return not self._runner.is_running()
 
-    def _queue_lcd_state(self, state: str) -> None:
+    def _queue_lcd_state(self, state: str, *, hold_for: float = 0.0) -> None:
         if self._lcd_view is None:
             return
-        self._lcd_override = state
+        now = time.monotonic()
+        self._lcd_override_state = state
+        self._lcd_override_until = now + hold_for if hold_for > 0 else 0.0
         self._update_lcd_state(force=True)
 
     def _update_lcd_state(self, *, force: bool = False) -> None:
         if self._lcd_view is None:
             return
-        if self._lcd_override is not None:
-            state = self._lcd_override
-            self._lcd_override = None
-        else:
+        now = time.monotonic()
+        state: Optional[str] = None
+        if self._lcd_override_state is not None:
+            if self._lcd_override_until == 0.0 or now < self._lcd_override_until:
+                state = self._lcd_override_state
+            else:
+                self._lcd_override_state = None
+                self._lcd_override_until = 0.0
+        if state is None:
             state = self._determine_lcd_state()
+            if (
+                state in {"answer_ended", "answer_stopped"}
+                and self._lcd_override_state is None
+            ):
+                self._lcd_override_state = state
+                self._lcd_override_until = now + 2.0
         if force or state != self._lcd_state:
             self._lcd_view.show_state(state)
             self._lcd_state = state
+        self._lcd_last_session_state = state
 
     def _determine_lcd_state(self) -> str:
         status = self._runner.get_status()
         if status.state == "error":
             return "error"
-        if self._speaker.is_playing:
-            return "answer_playing"
-        if status.state == "recording" or self._record_state == "recording":
+        if status.state in {"connecting", "recording"} or self._record_state == "recording":
             return "recording_active"
         if status.state == "stopping":
             lowered = (status.message or "").lower()
             if "playback still" in lowered or "waiting" in lowered:
                 return "waiting_for_answer"
+            if self._lcd_last_session_state == "sending_success":
+                return "waiting_for_answer"
             return "sending_success"
         if self._record_state == "await_close":
             return "waiting_for_answer"
-        if status.state == "connecting":
-            return "waiting_for_answer"
+        if self._speaker.is_playing and self._record_state != "recording":
+            return "answer_playing"
         if status.state == "idle":
             lowered = (status.message or "").lower()
             if "completed" in lowered:
+                if self._lcd_last_session_state == "answer_ended":
+                    return "waiting_for_recording"
                 return "answer_ended"
             if "stopped" in lowered:
+                if self._lcd_last_session_state == "answer_stopped":
+                    return "waiting_for_recording"
                 return "answer_stopped"
         return "waiting_for_recording"
 
