@@ -23,7 +23,7 @@ def test_show_state_updates_display():
 
     view.show_state("recording")
 
-    assert dummy.display_calls == [("Recording in progress...", 0, "success")]
+    assert dummy.display_calls == [("Recording...", 0, "success")]
 
 
 def test_unknown_state_logs_warning(caplog: pytest.LogCaptureFixture):
@@ -42,13 +42,13 @@ def test_unknown_state_logs_warning(caplog: pytest.LogCaptureFixture):
 @pytest.mark.parametrize(
     ("state", "expected"),
     [
-        ("waiting_for_recording", "Waiting for recording to begin"),
-        ("recording_active", "I am recording"),
-        ("sending_success", "Sending is successful"),
-        ("waiting_for_answer", "Waiting for an answer"),
-        ("answer_playing", "The answer is being played"),
-        ("answer_stopped", "Stop"),
-        ("answer_ended", "End"),
+        ("waiting_for_recording", "Ready for recording..."),
+        ("recording_active", "Recording..."),
+        ("sending", "Sending audio..."),
+        ("waiting_for_response", "Waiting for response..."),
+        ("answer_playing", "Playing response..."),
+        ("answer_stopped", "Stopped"),
+        ("answer_ended", "Done"),
     ],
 )
 def test_specific_states_render_expected_messages(state, expected):

@@ -53,6 +53,7 @@ class ConsoleController:
         self._lcd_override_until: float = 0.0
         self._lcd_last_session_state: Optional[str] = None
         self._lcd_task: Optional[asyncio.Task] = None
+        self._playback_seen: bool = False
         self._input = input_provider
         self._prefs_path = preferences_path
         self._config = config
@@ -157,6 +158,7 @@ class ConsoleController:
         if success:
             self._record_state = "recording"
             self._message = msg
+            self._playback_seen = False
             self._queue_lcd_state("recording_active", hold_for=1.0)
         else:
             self._record_state = "ready"
@@ -172,18 +174,18 @@ class ConsoleController:
                 self._message = "Recording stopped; press 2 again to end the session."
             else:
                 self._message = msg
-            self._queue_lcd_state("sending_success", hold_for=1.0)
+            self._queue_lcd_state("sending", hold_for=1.0)
             return
         lowered = (msg or "").lower()
         if "already requested" in lowered:
             self._record_state = "await_close"
             self._message = "Stop already requested; press 2 again to end the session."
-            self._queue_lcd_state("waiting_for_answer", hold_for=1.0)
+            self._queue_lcd_state("waiting_for_response", hold_for=1.0)
             return
         if "playback still running" in lowered:
             self._record_state = "await_close"
             self._message = "Playback still running; waiting to finish..."
-            self._queue_lcd_state("waiting_for_answer", hold_for=1.0)
+            self._queue_lcd_state("waiting_for_response", hold_for=1.0)
             return
         if "not running" in lowered:
             self._record_state = "ready"
@@ -208,7 +210,7 @@ class ConsoleController:
             if "not running" in lowered:
                 self._queue_lcd_state("answer_stopped", hold_for=2.0)
             elif "already requested" in lowered:
-                self._queue_lcd_state("waiting_for_answer", hold_for=1.0)
+                self._queue_lcd_state("waiting_for_response", hold_for=1.0)
             else:
                 self._queue_lcd_state("error")
         return success
@@ -344,6 +346,7 @@ class ConsoleController:
             and not self._runner.is_running()
         ):
             self._record_state = "ready"
+            self._playback_seen = False
 
     def _record_action_label(self) -> str:
         if self._record_state == "ready":
@@ -400,32 +403,54 @@ class ConsoleController:
 
     def _determine_lcd_state(self) -> str:
         status = self._runner.get_status()
+        pending_blocks = self._pending_speaker_blocks()
+        if pending_blocks > 0:
+            self._playback_seen = True
+
         if status.state == "error":
             return "error"
-        if status.state in {"connecting", "recording"} or self._record_state == "recording":
+
+        if (
+            self._record_state == "recording"
+            or status.state in {"connecting", "recording"}
+        ):
             return "recording_active"
-        if status.state == "stopping":
-            lowered = (status.message or "").lower()
-            if "playback still" in lowered or "waiting" in lowered:
-                return "waiting_for_answer"
-            if self._lcd_last_session_state == "sending_success":
-                return "waiting_for_answer"
-            return "sending_success"
-        if self._record_state == "await_close":
-            return "waiting_for_answer"
-        if self._speaker.is_playing and self._record_state != "recording":
+
+        speaker_active = (
+            pending_blocks > 0
+            or (self._playback_seen and (self._runner.is_running() or status.state == "stopping"))
+        )
+        if speaker_active and self._record_state != "recording":
             return "answer_playing"
+
+        if status.state == "stopping" or self._record_state == "await_close":
+            return "waiting_for_response"
+
         if status.state == "idle":
             lowered = (status.message or "").lower()
             if "completed" in lowered:
+                self._playback_seen = False
                 if self._lcd_last_session_state == "answer_ended":
                     return "waiting_for_recording"
                 return "answer_ended"
             if "stopped" in lowered:
+                self._playback_seen = False
                 if self._lcd_last_session_state == "answer_stopped":
                     return "waiting_for_recording"
                 return "answer_stopped"
+            self._playback_seen = False
+            return "waiting_for_recording"
+
         return "waiting_for_recording"
+
+    def _pending_speaker_blocks(self) -> int:
+        get_pending = getattr(self._speaker, "pending_blocks", None)
+        if not callable(get_pending):
+            return 0
+        try:
+            return int(get_pending())
+        except Exception:
+            return 0
 
     async def _lcd_heartbeat(self) -> None:
         try:
