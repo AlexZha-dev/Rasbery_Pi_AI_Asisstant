@@ -268,6 +268,7 @@ class ConsoleController:
 
     def _build_state(self) -> ConsoleState:
         self._sync_record_state()
+        self._sync_record_state()
         status = self._runner.get_status()
         return ConsoleState(
             tabs=self._tabs,
@@ -429,7 +430,12 @@ class ConsoleController:
         if speaker_active and self._record_state != "recording":
             return "answer_playing"
 
-        if status.state == "stopping" or self._record_state == "await_close":
+        if status.state == "stopping":
+            return "waiting_for_response"
+
+        if self._record_state == "await_close":
+            if not self._runner.is_running():
+                return "waiting_for_recording"
             return "waiting_for_response"
 
         if status.state == "idle":
