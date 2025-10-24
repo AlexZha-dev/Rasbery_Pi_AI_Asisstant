@@ -5,6 +5,7 @@ import asyncio
 from application.audio_session import AudioSession
 from application.session_runner import SessionRunner
 from controllers.console_controller import ConsoleController
+from infrastructure.button_interface import ButtonInterface
 from infrastructure.device_registry import DeviceRegistry
 from infrastructure.microphone_interface import MicrophoneInterface
 from infrastructure.sounds_adapters import (
@@ -40,15 +41,20 @@ async def main() -> None:
         playback_timeout=30.0,
         join_timeout=35.0,
     )
+    button = ButtonInterface(pin=17)
     controller = ConsoleController(
         microphone=microphone,
         speaker=speaker,
         registry=registry,
         session_runner=runner,
         lcd_view=LCDView(),
+        button=button,
     )
     print("[Console] Starting async console.")
-    await controller.run()
+    try:
+        await controller.run()
+    finally:
+        button.close()
     print("[Console] Console shutdown complete.")
 
 

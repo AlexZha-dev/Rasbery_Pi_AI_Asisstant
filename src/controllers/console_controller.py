@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import asyncio
 import contextlib
+import functools
 import time
 from dataclasses import dataclass
 from pathlib import Path
@@ -10,6 +11,7 @@ from typing import Callable, Literal, Optional, Tuple
 from application.session_runner import RunnerStatus, SessionRunner
 from config.preferences import load_preferences, save_preferences
 from exceptions.audio_exceptions import AudioError
+from infrastructure.button_interface import ButtonInterface
 from infrastructure.device_registry import DeviceRegistry, DeviceSnapshot
 from infrastructure.microphone_interface import MicrophoneInterface
 from infrastructure.speaker_interface import SpeakerInterface
@@ -38,6 +40,7 @@ class ConsoleController:
         session_runner: SessionRunner,
         view: Optional[ConsoleView] = None,
         lcd_view: Optional[LCDView] = None,
+        button: Optional[ButtonInterface] = None,
         input_provider: InputProvider = input,
         preferences_path: Optional[Path] = None,
         config: ControllerConfig = ControllerConfig(),
@@ -48,12 +51,15 @@ class ConsoleController:
         self._runner = session_runner
         self._view = view or ConsoleView()
         self._lcd_view = lcd_view
+        self._button = button
         self._lcd_state: Optional[str] = None
         self._lcd_override_state: Optional[str] = None
         self._lcd_override_until: float = 0.0
         self._lcd_last_session_state: Optional[str] = None
         self._lcd_task: Optional[asyncio.Task] = None
+        self._button_task: Optional[asyncio.Task] = None
         self._playback_seen: bool = False
+        self._button_action_lock = asyncio.Lock()
         self._input = input_provider
         self._prefs_path = preferences_path
         self._config = config
@@ -75,9 +81,15 @@ class ConsoleController:
 
     async def run(self) -> None:
         running = True
+        loop = asyncio.get_running_loop()
         if self._lcd_view is not None and self._lcd_task is None:
-            loop = asyncio.get_running_loop()
             self._lcd_task = loop.create_task(self._lcd_heartbeat())
+        if (
+            self._button is not None
+            and self._button.is_enabled
+            and self._button_task is None
+        ):
+            self._button_task = loop.create_task(self._button_listener())
         try:
             while running:
                 self._maybe_refresh_devices()
@@ -102,6 +114,14 @@ class ConsoleController:
                 with contextlib.suppress(asyncio.CancelledError):
                     await self._lcd_task
                 self._lcd_task = None
+            if self._button_task is not None:
+                self._button_task.cancel()
+                with contextlib.suppress(asyncio.CancelledError):
+                    await self._button_task
+                self._button_task = None
+            if self._button is not None:
+                self._button.close()
+                self._button = None
 
     def get_state(self) -> ConsoleState:
         self._maybe_refresh_devices()
@@ -463,6 +483,24 @@ class ConsoleController:
             return int(get_pending())
         except Exception:
             return 0
+
+    async def _button_listener(self) -> None:
+        button = self._button
+        if button is None or not button.is_enabled:
+            return
+        loop = asyncio.get_running_loop()
+        wait_press = functools.partial(button.wait_for_press, 0.1)
+        wait_release = functools.partial(button.wait_for_release, 0.3)
+        try:
+            while True:
+                pressed = await loop.run_in_executor(None, wait_press)
+                if not pressed:
+                    continue
+                async with self._button_action_lock:
+                    await self._toggle_session()
+                await loop.run_in_executor(None, wait_release)
+        except asyncio.CancelledError:  # pragma: no cover - cancellation path
+            pass
 
     def _speaker_recent_activity(self, window: float = 0.75) -> bool:
         activity_fn = getattr(self._speaker, "had_recent_activity", None)
