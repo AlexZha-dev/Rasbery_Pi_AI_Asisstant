@@ -19,17 +19,17 @@ class LCDView:
     """View-controller that mirrors session state on a 16x2 RGB LCD panel."""
 
     _STATE_TEMPLATES: Dict[str, Tuple[str, str]] = {
-        "waiting_for_recording": ("Ready for recording...", "info"),
-        "waiting_for_input": ("Ready for recording...", "info"),
-        "recording_active": ("Recording...", "success"),
-        "recording": ("Recording...", "success"),
-        "sending": ("Sending audio...", "info"),
-        "waiting_for_response": ("Waiting for response...", "warning"),
-        "answer_playing": ("Playing response...", "success"),
-        "answer_stopped": ("Stopped", "warning"),
-        "answer_ended": ("Done", "success"),
-        "error": ("Error occurred!", "error"),
-        "response_received": ("Response received!", "success"),
+        "waiting_for_recording": ("Ready to record", "info"),
+        "waiting_for_input":     ("Ready to record", "info"),
+        "recording_active":      ("Recording...", "success"),
+        "recording":             ("Recording...", "success"),
+        "sending":               ("Sending audio", "info"),
+        "waiting_for_response":  ("Waiting reply", "warning"),
+        "answer_playing":        ("Playing reply", "success"),
+        "answer_stopped":        ("Stopped", "warning"),
+        "answer_ended":          ("Done", "success"),
+        "error":                 ("Error!", "error"),
+        "response_received":     ("Reply received", "success"),
     }
 
     def __init__(

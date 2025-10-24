@@ -42,11 +42,11 @@ def test_unknown_state_logs_warning(caplog: pytest.LogCaptureFixture):
 @pytest.mark.parametrize(
     ("state", "expected"),
     [
-        ("waiting_for_recording", "Ready for recording..."),
+        ("waiting_for_recording", "Ready to record"),
         ("recording_active", "Recording..."),
-        ("sending", "Sending audio..."),
-        ("waiting_for_response", "Waiting for response..."),
-        ("answer_playing", "Playing response..."),
+        ("sending", "Sending audio"),
+        ("waiting_for_response", "Waiting reply"),
+        ("answer_playing", "Playing reply"),
         ("answer_stopped", "Stopped"),
         ("answer_ended", "Done"),
     ],
