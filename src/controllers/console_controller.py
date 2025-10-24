@@ -404,7 +404,8 @@ class ConsoleController:
     def _determine_lcd_state(self) -> str:
         status = self._runner.get_status()
         pending_blocks = self._pending_speaker_blocks()
-        if pending_blocks > 0:
+        recent_activity = self._speaker_recent_activity()
+        if pending_blocks > 0 or recent_activity:
             self._playback_seen = True
 
         if status.state == "error":
@@ -418,7 +419,12 @@ class ConsoleController:
 
         speaker_active = (
             pending_blocks > 0
-            or (self._playback_seen and (self._runner.is_running() or status.state == "stopping"))
+            or recent_activity
+            or (
+                self._playback_seen
+                and (self._runner.is_running() or status.state == "stopping")
+                and self._speaker_is_output_running()
+            )
         )
         if speaker_active and self._record_state != "recording":
             return "answer_playing"
@@ -451,6 +457,34 @@ class ConsoleController:
             return int(get_pending())
         except Exception:
             return 0
+
+    def _speaker_recent_activity(self, window: float = 0.75) -> bool:
+        activity_fn = getattr(self._speaker, "had_recent_activity", None)
+        if not callable(activity_fn):
+            return False
+        try:
+            return bool(activity_fn(window=window))
+        except TypeError:
+            try:
+                return bool(activity_fn(window))
+            except Exception:
+                return False
+        except Exception:
+            return False
+
+    def _speaker_is_output_running(self) -> bool:
+        is_playing = getattr(self._speaker, "is_playing", None)
+        if callable(is_playing):
+            try:
+                return bool(is_playing())
+            except TypeError:
+                pass
+            except Exception:
+                return False
+        if isinstance(is_playing, bool):
+            return is_playing
+        attr = getattr(self._speaker, "is_playing", False)
+        return bool(attr)
 
     async def _lcd_heartbeat(self) -> None:
         try:

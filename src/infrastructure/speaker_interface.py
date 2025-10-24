@@ -31,6 +31,7 @@ class SpeakerInterface:
         self.channels = channels
         self.blocksize = blocksize
         self.dtype = dtype
+        self._last_play_activity: float = 0.0
 
         defaults = sd.default.device
         if isinstance(defaults, tuple) and len(defaults) >= 2:
@@ -82,6 +83,7 @@ class SpeakerInterface:
                 arr = np.concatenate([arr, pad], axis=0)
         # Блокирующий put в очереди (не дропаем)
         self._play_queue.put(arr, block=True)
+        self._last_play_activity = time.monotonic()
 
     def _output_callback(self, outdata, frames, time_info, status):
         try:
@@ -188,6 +190,12 @@ class SpeakerInterface:
     def pending_blocks(self) -> int:
         """Approximate number of audio blocks pending in output queue."""
         return self._play_queue.qsize()
+
+    def had_recent_activity(self, window: float = 0.75) -> bool:
+        """Return True if play() was invoked within the last *window* seconds."""
+        if self._last_play_activity == 0.0:
+            return False
+        return (time.monotonic() - self._last_play_activity) <= max(window, 0.0)
 
     def _request_stop(self, join_timeout: float) -> None:
         with self._lock:
