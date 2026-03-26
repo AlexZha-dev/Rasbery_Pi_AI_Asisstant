@@ -1,0 +1,38 @@
+services:
+  app:
+    build:
+      context: .
+      dockerfile: Dockerfile
+    image: raspberrypi-audio-console:latest
+    command: python src/console_main.py
+    environment:
+      AUDIO_WS_URL: ${AUDIO_WS_URL:-wss://your-server.example/ws/audio}
+    stdin_open: true
+    tty: true
+    # Uncomment for host audio devices on Linux/Raspberry Pi:
+    # devices:
+    #   - /dev/snd:/dev/snd
+
+  ws-local:
+    build:
+      context: .
+      dockerfile: Dockerfile
+    image: raspberrypi-audio-console:latest
+    command: python src/tests/websocket_server.py
+    network_mode: host
+    profiles: ["local"]
+
+  app-local:
+    build:
+      context: .
+      dockerfile: Dockerfile
+    image: raspberrypi-audio-console:latest
+    command: python src/console_main.py
+    environment:
+      AUDIO_WS_URL: ws://127.0.0.1:8765
+    network_mode: host
+    stdin_open: true
+    tty: true
+    depends_on:
+      - ws-local
+    profiles: ["local"]

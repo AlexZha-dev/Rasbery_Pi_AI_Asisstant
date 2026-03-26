@@ -25,6 +25,6 @@ repos:
     hooks:
       - id: pytest
         name: Run pytest
-        entry: bash -c 'pytest -q --tb=short || true'
+        entry: bash -c 'pytest -q --tb=short'
         language: system
         pass_filenames: false

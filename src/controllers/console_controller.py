@@ -288,7 +288,6 @@ class ConsoleController:
 
     def _build_state(self) -> ConsoleState:
         self._sync_record_state()
-        self._sync_record_state()
         status = self._runner.get_status()
         return ConsoleState(
             tabs=self._tabs,

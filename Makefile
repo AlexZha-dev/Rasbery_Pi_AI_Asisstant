@@ -2,13 +2,14 @@
 PYTHON = python3
 PIP = pip
 REQ_FILE = requirements.txt
+REQ_DEV_FILE = requirements-dev.txt
 
 # -------------------------------
 # Установка зависимостей
 install:
 	$(PIP) install --upgrade pip
 	$(PIP) install -r $(REQ_FILE)
-	$(PIP) install black flake8 isort pytest pre-commit
+	$(PIP) install -r $(REQ_DEV_FILE)
 
 # -------------------------------
 # Проверка форматеров

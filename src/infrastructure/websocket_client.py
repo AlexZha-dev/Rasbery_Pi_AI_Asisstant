@@ -1,6 +1,7 @@
 import asyncio
 import json
 import logging
+import random
 import time
 from contextlib import suppress
 from datetime import datetime, timezone
@@ -21,6 +22,17 @@ if not logger.handlers:
     logger.addHandler(handler)
 logger.setLevel(logging.INFO)
 logger.propagate = False
+
+_SENSITIVE_HEADER_MARKERS = (
+    "authorization",
+    "cookie",
+    "set-cookie",
+    "token",
+    "secret",
+    "api-key",
+    "x-api-key",
+    "proxy-authorization",
+)
 
 
 def _utc_timestamp() -> str:
@@ -56,6 +68,40 @@ def _headers_to_dict(headers) -> Dict[str, str]:
     return result
 
 
+def _is_sensitive_header(header_name: str) -> bool:
+    lowered = header_name.strip().lower()
+    return any(marker in lowered for marker in _SENSITIVE_HEADER_MARKERS)
+
+
+def _mask_secret(value: str) -> str:
+    if value is None:
+        return ""
+    if len(value) <= 4:
+        return "*" * len(value)
+    return f"{value[:2]}***{value[-2:]}"
+
+
+def _sanitize_headers(headers: Dict[str, str]) -> Dict[str, str]:
+    masked: Dict[str, str] = {}
+    for key, value in headers.items():
+        if _is_sensitive_header(key):
+            masked[key] = _mask_secret(value)
+        else:
+            masked[key] = value
+    return masked
+
+
+def _safe_url_for_logs(url: str) -> str:
+    try:
+        parsed = urlsplit(url)
+    except Exception:
+        return "-"
+    host = parsed.hostname or "-"
+    port = f":{parsed.port}" if parsed.port else ""
+    path = parsed.path or ""
+    return f"{parsed.scheme}://{host}{port}{path}"
+
+
 class AudioWebSocketClient:
     _SESSION_INDEX = 0
     _ACTIVE_SESSIONS = 0
@@ -65,6 +111,13 @@ class AudioWebSocketClient:
         url: Optional[str] = None,
         on_receive: Optional[Callable[[AudioMessage], None]] = None,
         mode: Optional[str] = None,  # 'json' or 'binary' (auto if None)
+        max_frame_bytes: int = 4 * 1024 * 1024,
+        connect_timeout: float = 10.0,
+        max_retries: Optional[int] = 5,
+        retry_backoff_base: float = 0.5,
+        retry_backoff_max: float = 8.0,
+        ready_timeout: float = 5.0,
+        log_payload_snippets: bool = False,
     ):
         self.url = url or AUDIO_WS_URL
         self._ws: Optional[WebSocketClientProtocol] = None
@@ -75,6 +128,16 @@ class AudioWebSocketClient:
         self._ready_event = asyncio.Event()
         self._closing = False
         self._mode = mode or self._infer_mode_from_url(self.url)
+        self._max_frame_bytes = max(1024, int(max_frame_bytes))
+        self._connect_timeout = max(0.1, float(connect_timeout))
+        if max_retries is None:
+            self._max_retries = None
+        else:
+            self._max_retries = max(1, int(max_retries))
+        self._retry_backoff_base = max(0.1, float(retry_backoff_base))
+        self._retry_backoff_max = max(self._retry_backoff_base, float(retry_backoff_max))
+        self._ready_timeout = max(0.1, float(ready_timeout))
+        self._log_payload_snippets = bool(log_payload_snippets)
         # Binary protocol state
         self._binary_started: bool = False
         self._binary_chunks_sent: int = 0
@@ -146,7 +209,7 @@ class AudioWebSocketClient:
         else:
             text = str(payload)
             size = len(text.encode("utf-8", "ignore"))
-            snippet = _truncate_text(text)
+            snippet = _truncate_text(text) if self._log_payload_snippets else None
         parts = [direction, frame_type, f"len={size}"]
         if message_type:
             parts.append(f"type={message_type}")
@@ -291,32 +354,48 @@ class AudioWebSocketClient:
         self._close_trigger_detail = None
         self._closed_at = None
         self._ready_event.clear()
+        self._connected.clear()
+        safe_url = _safe_url_for_logs(self.url)
+        attempt = 0
         while True:
+            attempt += 1
             try:
-                self._ws = await websockets.connect(self.url, max_size=None)
+                self._ws = await websockets.connect(
+                    self.url,
+                    max_size=self._max_frame_bytes,
+                    open_timeout=self._connect_timeout,
+                )
                 AudioWebSocketClient._SESSION_INDEX += 1
                 self._session_name = f"ws-{AudioWebSocketClient._SESSION_INDEX}"
                 AudioWebSocketClient._ACTIVE_SESSIONS += 1
                 self._connected_at = time.monotonic()
-                self._handshake_request_headers = _headers_to_dict(
-                    getattr(self._ws, "request_headers", None)
+                self._handshake_request_headers = _sanitize_headers(
+                    _headers_to_dict(getattr(self._ws, "request_headers", None))
                 )
-                self._handshake_response_headers = _headers_to_dict(
-                    getattr(self._ws, "response_headers", None)
+                self._handshake_response_headers = _sanitize_headers(
+                    _headers_to_dict(getattr(self._ws, "response_headers", None))
                 )
                 self._handshake_subprotocol = getattr(self._ws, "subprotocol", None)
                 handshake_extra = {
                     "request_headers": self._handshake_request_headers,
                     "response_headers": self._handshake_response_headers,
                 }
+                if self._log_payload_snippets:
+                    handshake_note = _truncate_text(json.dumps(handshake_extra))
+                else:
+                    handshake_note = (
+                        f"request_headers={len(self._handshake_request_headers)} "
+                        f"response_headers={len(self._handshake_response_headers)}"
+                    )
                 self._log(
                     "WS_OPEN",
                     " ".join(
                         [
-                            f"url={self.url}",
+                            f"url={safe_url}",
                             f"subprotocol={self._handshake_subprotocol or '-'}",
                             f"active={AudioWebSocketClient._ACTIVE_SESSIONS}",
-                            f"handshake={_truncate_text(json.dumps(handshake_extra))}",
+                            f"max_frame_bytes={self._max_frame_bytes}",
+                            f"handshake={handshake_note}",
                         ]
                     ),
                 )
@@ -324,13 +403,31 @@ class AudioWebSocketClient:
                 self._recv_task = asyncio.create_task(self._receiver_loop())
                 return
             except Exception as exc:
+                if self._max_retries is not None and attempt >= self._max_retries:
+                    self._log(
+                        "WS_ERROR",
+                        (
+                            f"connection_failed attempts={attempt} "
+                            f"url={safe_url} giving_up=True error={exc}"
+                        ),
+                        level=logging.ERROR,
+                        exc_info=True,
+                    )
+                    raise ConnectionError(
+                        f"Unable to connect to websocket after {attempt} attempts"
+                    ) from exc
                 self._log(
                     "WS_ERROR",
-                    f"connection_failed url={self.url} error={exc}",
+                    f"connection_failed attempt={attempt} url={safe_url} error={exc}",
                     level=logging.WARNING,
                     exc_info=True,
                 )
-                await asyncio.sleep(2)
+                delay = min(
+                    self._retry_backoff_max,
+                    self._retry_backoff_base * (2 ** max(0, attempt - 1)),
+                )
+                jitter = random.uniform(0.0, min(0.2, delay * 0.2))
+                await asyncio.sleep(delay + jitter)
 
     async def close(
         self, reason: str = "client_shutdown", trigger: Optional[str] = None
@@ -704,18 +801,24 @@ class AudioWebSocketClient:
         self._binary_started = False
         self._binary_chunks_sent = 0
         self._binary_chunk_bytes = 0
+        self._binary_expected_sampwidth = 2
+        self._binary_channels = 1
 
-    async def _wait_for_ready(self, timeout: float = 5.0) -> None:
+    async def _wait_for_ready(self, timeout: Optional[float] = None) -> None:
         if self._ready_event.is_set():
             return
+        wait_timeout = self._ready_timeout if timeout is None else float(timeout)
         try:
-            await asyncio.wait_for(self._ready_event.wait(), timeout=timeout)
-        except asyncio.TimeoutError:
+            await asyncio.wait_for(self._ready_event.wait(), timeout=wait_timeout)
+        except asyncio.TimeoutError as exc:
             self._log(
                 "WS_ERROR",
-                f"ready_wait_timeout timeout={timeout}",
-                level=logging.WARNING,
+                f"ready_wait_timeout timeout={wait_timeout}",
+                level=logging.ERROR,
             )
+            raise TimeoutError(
+                f"Server did not send ready signal within {wait_timeout:.2f}s"
+            ) from exc
 
     def _log_ack(self, payload: str) -> None:
         try:

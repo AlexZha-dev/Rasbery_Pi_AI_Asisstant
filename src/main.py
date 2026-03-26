@@ -15,10 +15,12 @@ async def main():
     spk_adapter = SpeakerAsyncAdapter(spk)
     ws_client = AudioWebSocketClient()
 
-    session = AudioSession(ws_client, mic_adapter, spk_adapter)
-    await session.run_once(timeout=5, playback_timeout=30.0)
-
-    await ws_client.close(reason="main_shutdown", trigger="main")
+    try:
+        session = AudioSession(ws_client, mic_adapter, spk_adapter)
+        await session.run_once(timeout=5, playback_timeout=30.0)
+    finally:
+        await ws_client.close(reason="main_shutdown", trigger="main")
+        spk_adapter.close()
 
 
 if __name__ == "__main__":

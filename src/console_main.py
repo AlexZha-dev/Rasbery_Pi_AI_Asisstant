@@ -20,15 +20,13 @@ from ui.lcd_view import LCDView
 async def main() -> None:
     microphone = MicrophoneInterface(samplerate=16000, channels=1, blocksize=1024)
     speaker = SpeakerInterface(samplerate=16000, channels=1, blocksize=1024)
+    mic_adapter = MicrophoneAsyncAdapter(microphone)
+    spk_adapter = SpeakerAsyncAdapter(speaker)
     registry = DeviceRegistry()
 
     def session_factory():
         ws_client = AudioWebSocketClient()
-        session = AudioSession(
-            ws_client,
-            MicrophoneAsyncAdapter(microphone),
-            SpeakerAsyncAdapter(speaker),
-        )
+        session = AudioSession(ws_client, mic_adapter, spk_adapter)
         return session, ws_client
 
     def request_stop():
@@ -55,6 +53,7 @@ async def main() -> None:
         await controller.run()
     finally:
         button.close()
+        spk_adapter.close()
     print("[Console] Console shutdown complete.")
 
 

@@ -7,12 +7,17 @@ from typing import Any, Dict, Optional, Tuple
 
 import numpy as np
 
-from dto.audio_message import base64_to_np
+from dto.audio_message import MAX_AUDIO_ARRAY_BYTES, base64_to_np
 from exceptions.audio_exceptions import AudioError
 from infrastructure.websocket_client import AudioWebSocketClient
 
 
 class AudioSession:
+    MAX_JSON_AUDIO_BYTES = MAX_AUDIO_ARRAY_BYTES
+    MAX_PLAYBACK_FILE_BYTES = 16 * 1024 * 1024
+    MAX_CHANNELS = 8
+    MAX_SAMPLE_RATE = 192000
+
     def __init__(self, ws: AudioWebSocketClient, mic_adapter, spk_adapter):
         self.ws = ws
         self.mic = mic_adapter
@@ -58,7 +63,18 @@ class AudioSession:
         if msg.session_id not in {None, self.session_id}:
             return
         if msg.type == "audio_chunk":
-            data = base64_to_np(msg.data_b64, msg.dtype, msg.shape)
+            try:
+                data = base64_to_np(
+                    msg.data_b64,
+                    msg.dtype,
+                    msg.shape,
+                    max_decoded_bytes=self.MAX_JSON_AUDIO_BYTES,
+                )
+            except Exception as exc:
+                print(
+                    f"[Session {self.session_id}] Ignoring malformed audio_chunk payload: {exc}"
+                )
+                return
             await self._queue.put(data)
         elif msg.type == "playback_file_start":
             await self._handle_playback_start(msg)
@@ -112,6 +128,12 @@ class AudioSession:
         except AttributeError:
             # Older client without prepare_stream or non-binary mode
             pass
+        reset_speaker = getattr(self.spk, "reset", None)
+        if callable(reset_speaker):
+            try:
+                reset_speaker()
+            except Exception:
+                pass
         self.spk.spk.start_output()
         try:
             self.mic.mic.start_recording()
@@ -187,6 +209,21 @@ class AudioSession:
                     await self.spk.play(data)
                 print(f"[Session {self.session_id}] Completed")
         finally:
+            flush_playback = getattr(self.spk, "flush", None)
+            if callable(flush_playback):
+                try:
+                    maybe_result = flush_playback(timeout=1.5)
+                    if asyncio.iscoroutine(maybe_result):
+                        await maybe_result
+                except TypeError:
+                    try:
+                        maybe_result = flush_playback()
+                        if asyncio.iscoroutine(maybe_result):
+                            await maybe_result
+                    except Exception:
+                        pass
+                except Exception:
+                    pass
             self.spk.spk.stop_output()
             if (
                 run_error is not None
@@ -263,6 +300,9 @@ class AudioSession:
                 "format": "wav",
                 "buffer": bytearray(),
                 "message_id": message_id,
+                "bytes_received": 0,
+                "max_bytes": self.MAX_PLAYBACK_FILE_BYTES,
+                "dropped": False,
             }
             self._pending_playback_files += 1
             print(f"[Session {self.session_id}] Playback format=wav")
@@ -271,10 +311,15 @@ class AudioSession:
             # Default to PCM if unspecified or unknown to avoid dropping audio
             playback_format = "pcm"
 
-        sample_rate = int(_first("sample_rate", 16000))
-        channels = int(_first("channels", 1))
-        # Accept sampwidth or bit_depth_bytes synonyms
-        sampwidth = int(_first("sampwidth", _first("bit_depth_bytes", 2)))
+        try:
+            sample_rate = int(_first("sample_rate", 16000))
+            channels = int(_first("channels", 1))
+            # Accept sampwidth or bit_depth_bytes synonyms
+            sampwidth = int(_first("sampwidth", _first("bit_depth_bytes", 2)))
+        except (TypeError, ValueError):
+            print(f"[Session {self.session_id}] Invalid playback metadata; skipping file")
+            self._playback_meta = None
+            return
         pcm_format = str(_first("pcm_format", "s16le")).lower()
 
         pcm_meta = self._build_pcm_meta(
@@ -298,8 +343,13 @@ class AudioSession:
         meta = self._playback_meta
         if not meta:
             return
-        if meta.get("format") == "wav":
+        if meta.get("format") == "wav" and not meta.get("dropped"):
             await self._flush_wav_buffer(meta.get("buffer", bytearray()))
+        elif meta.get("dropped"):
+            print(
+                f"[Session {self.session_id}] Dropped oversized playback payload "
+                f"reason={meta.get('drop_reason', 'size_limit')}"
+            )
         self._playback_meta = None
         if self._pending_playback_files > 0:
             self._pending_playback_files -= 1
@@ -317,7 +367,17 @@ class AudioSession:
             return
         fmt = meta.get("format", "pcm")
         if fmt == "wav":
+            max_bytes = int(meta.get("max_bytes", self.MAX_PLAYBACK_FILE_BYTES))
+            received = int(meta.get("bytes_received", 0))
+            next_size = received + len(payload)
+            if next_size > max_bytes:
+                meta["dropped"] = True
+                meta["drop_reason"] = "size_limit"
+                return
             meta.setdefault("buffer", bytearray()).extend(payload)
+            meta["bytes_received"] = next_size
+            return
+        if len(payload) > self.MAX_PLAYBACK_FILE_BYTES:
             return
         arr = self._decode_pcm_bytes(payload, meta)
         if arr is not None:
@@ -335,6 +395,15 @@ class AudioSession:
         pcm_format: str,
         sample_rate: int,
     ) -> Optional[Dict[str, Any]]:
+        channels = int(channels)
+        sample_rate = int(sample_rate)
+        sampwidth = int(sampwidth)
+        if channels < 1 or channels > self.MAX_CHANNELS:
+            return None
+        if sample_rate < 1000 or sample_rate > self.MAX_SAMPLE_RATE:
+            return None
+        if sampwidth not in {1, 2, 4}:
+            return None
         signed, endian = self._parse_pcm_format(pcm_format, sampwidth)
         dtype = self._resolve_pcm_dtype(sampwidth, signed, endian)
         if dtype is None:
@@ -384,6 +453,10 @@ class AudioSession:
     def _decode_pcm_bytes(
         self, payload: bytes, meta: Dict[str, Any]
     ) -> Optional[np.ndarray]:
+        if not payload:
+            return None
+        if len(payload) > self.MAX_PLAYBACK_FILE_BYTES:
+            return None
         dtype = meta.get("dtype")
         channels = int(meta.get("channels", 1))
         if dtype is None:
@@ -426,6 +499,7 @@ class AudioSession:
         message_id = meta.get("message_id")
         if not message_id:
             return
+        status = "dropped" if meta.get("dropped") else "played"
         # Best-effort: wait briefly for speaker queue to drain before ACK
         try:
             await self._await_speaker_drain(timeout=3.0)
@@ -433,7 +507,7 @@ class AudioSession:
             pass
         try:
             await self.ws.send_playback_ack(
-                self.session_id, message_id, status="played"
+                self.session_id, message_id, status=status
             )
         except Exception:
             # Non-fatal

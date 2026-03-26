@@ -1,61 +1,110 @@
-# Raspberry Pi Audio Console (Mic → WebSocket → Speaker)
+# Raspberry Pi Audio Console (Mic -> WebSocket -> Speaker)
 
-A small Python project that streams microphone audio to a WebSocket server and plays streamed audio back through the speaker. It includes:
-- An interactive console UI for selecting input/output devices and toggling a recording session.
-- A single-shot script to run one session end-to-end.
-- A local echo WebSocket server for offline development and tests.
+This project streams microphone audio to a WebSocket backend and plays server responses through a speaker.
+
+It provides:
+- An interactive console UI for device selection and session control
+- A single-run script for quick end-to-end checks
+- A local echo WebSocket server for development and testing
+
+## Features
+- Real-time microphone capture and speaker playback
+- Binary and JSON WebSocket protocol support
+- Session runner for non-blocking console interaction
+- Local hardware integration for LCD and GPIO button (optional)
+- Safer defaults for transport and payload handling
 
 ## Requirements
-- Python 3.10+ (tested with 3.12)
-- System libs: PortAudio and libsndfile
-  - Debian/Ubuntu/Raspberry Pi OS: `sudo apt-get install -y libportaudio2 libsndfile1` (dev headers: `python3-dev portaudio19-dev libsndfile1-dev`)
+- Python 3.10+ (tested with Python 3.12)
+- System libraries: PortAudio and libsndfile
+
+For Debian/Ubuntu/Raspberry Pi OS:
+```bash
+sudo apt-get install -y libportaudio2 libsndfile1
+```
+
+Development headers (if needed):
+```bash
+sudo apt-get install -y python3-dev portaudio19-dev libsndfile1-dev
+```
 
 ## Installation
 ```bash
-python -m venv venv && source venv/bin/activate
+python -m venv venv
+source venv/bin/activate
 make install
 ```
 
+`make install` installs:
+- Runtime dependencies from `requirements.txt`
+- Dev/test tooling from `requirements-dev.txt`
+
 ## Configuration
-Set the WebSocket URL via environment or a `.env` file in the project root:
+Set `AUDIO_WS_URL` via environment variable or a `.env` file in the project root:
+
+```env
+AUDIO_WS_URL=wss://your-server.example/ws/audio
 ```
-AUDIO_WS_URL=ws://127.0.0.1:8765
-```
-Note: The app fails fast if `AUDIO_WS_URL` is missing.
+
+Security rules:
+- The app fails fast if `AUDIO_WS_URL` is missing
+- `ws://` is accepted only for localhost (`127.0.0.1`, `localhost`, `::1`)
+- Remote targets must use `wss://`
 
 ## Quick Start
-Run the included local echo server (persists WAV under `src/tests/outputs/`):
+Run local echo server:
 ```bash
 AUDIO_WS_URL=ws://127.0.0.1:8765 python src/tests/websocket_server.py
 ```
-In another terminal, start the console UI:
+
+In another terminal, start the console:
 ```bash
 python src/console_main.py
 ```
-Console keys: `1` previous tab, `3` next tab, `2` accept/toggle, `q` quit. In Microphone/Speaker tabs, press `2` and enter a device index to select.
 
-Single-shot example (records briefly, then plays streamed audio):
+Console keys:
+- `1` previous tab
+- `3` next tab
+- `2` accept/toggle action
+- `q` quit
+
+On `Microphone` and `Speaker` tabs, press `2` and enter a device index.
+
+Single-run session example:
 ```bash
 python src/main.py
 ```
 
 ## Development
-- Format: `make format` (isort → black)
-- Lint: `make lint` (flake8, isort --check-only, black --check)
-- Tests: `make test` or `pytest -q`
-- Pre-commit: `pre-commit install` then `make precommit`
+Common commands:
+- `make format` - run `isort` and `black`
+- `make lint` - run `flake8`, `isort --check-only`, and `black --check`
+- `make test` - run pytest
+- `make precommit` - run all pre-commit hooks
 
-## Project Structure
-- `src/application/` — session orchestration (`audio_session.py`, `session_runner.py`)
-- `src/infrastructure/` — devices/network adapters (mic, speaker, websocket, lcd)
-- `src/controllers/` — console controller and flows
-- `src/ui/` — console rendering
-- `src/dto/` — dataclasses and codecs (audio payloads)
-- `src/config/` — env/config loaders
-- `src/exceptions/` — domain-specific errors
-- `src/tests/` — integration helpers, echo server, and tests
-- Entrypoints: `src/console_main.py` (console), `src/main.py` (single session)
+Optional:
+```bash
+pre-commit install
+```
+
+## Project Layout
+- `src/application/` - session orchestration (`audio_session.py`, `session_runner.py`)
+- `src/infrastructure/` - hardware/network adapters (mic, speaker, websocket, lcd, button)
+- `src/controllers/` - console workflow coordination
+- `src/ui/` - terminal and LCD presentation layer
+- `src/dto/` - message/data codecs
+- `src/config/` - environment and preferences configuration
+- `src/exceptions/` - domain-specific exceptions
+- `src/tests/` - integration helpers, local server, and automated tests
+
+Entry points:
+- `src/console_main.py` - interactive console mode
+- `src/main.py` - single session mode
 
 ## Troubleshooting
-- “AUDIO_WS_URL is not defined” → create `.env` or export the variable.
-- PortAudio/ALSA errors → ensure the correct devices are selected in the console, and required libs are installed. Try different indices if sample rate is unsupported.
+- `AUDIO_WS_URL is not defined`
+  - Set it in your shell or create a `.env` file in the project root
+- Cannot connect to remote `ws://` endpoint
+  - Use `wss://` for non-localhost hosts
+- PortAudio or ALSA errors
+  - Verify system packages are installed and pick valid input/output device indices

@@ -5,14 +5,56 @@ from typing import Any, Dict, Optional, Tuple
 
 import numpy as np
 
+MAX_AUDIO_ARRAY_BYTES = 8 * 1024 * 1024
+
 
 def np_to_base64(arr: np.ndarray) -> str:
     return base64.b64encode(arr.tobytes()).decode("ascii")
 
 
-def base64_to_np(b64: str, dtype: str, shape: Tuple[int]) -> np.ndarray:
-    raw = base64.b64decode(b64)
-    return np.frombuffer(raw, dtype=dtype).reshape(shape)
+def base64_to_np(
+    b64: str,
+    dtype: str,
+    shape: Tuple[int],
+    *,
+    max_decoded_bytes: int = MAX_AUDIO_ARRAY_BYTES,
+) -> np.ndarray:
+    if b64 is None:
+        raise ValueError("Missing audio payload")
+    if dtype is None:
+        raise ValueError("Missing dtype")
+    if shape is None:
+        raise ValueError("Missing shape")
+
+    np_dtype = np.dtype(dtype)
+    try:
+        dims = tuple(int(dim) for dim in shape)
+    except (TypeError, ValueError) as exc:
+        raise ValueError(f"Invalid shape: {shape!r}") from exc
+
+    if not dims:
+        raise ValueError("Audio shape must not be empty")
+    if any(dim < 0 for dim in dims):
+        raise ValueError(f"Audio shape dimensions must be non-negative: {dims!r}")
+
+    expected_items = 1
+    for dim in dims:
+        expected_items *= dim
+    expected_bytes = expected_items * int(np_dtype.itemsize)
+    if expected_bytes < 0:
+        raise ValueError("Decoded payload size must not be negative")
+    if expected_bytes > int(max_decoded_bytes):
+        raise ValueError(
+            f"Decoded payload too large: {expected_bytes} > {max_decoded_bytes}"
+        )
+
+    raw = base64.b64decode(b64, validate=True)
+    if len(raw) != expected_bytes:
+        raise ValueError(
+            f"Decoded payload size mismatch: got {len(raw)} bytes, expected {expected_bytes}"
+        )
+
+    return np.frombuffer(raw, dtype=np_dtype).reshape(dims)
 
 
 @dataclass

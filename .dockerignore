@@ -1,0 +1,17 @@
+.git
+.github
+.gitignore
+.env
+.env.*
+!.env.sample
+.pytest_cache
+__pycache__
+*.py[cod]
+*.pyo
+*.pyd
+*.so
+venv
+.venv
+dist
+build
+src/tests/outputs

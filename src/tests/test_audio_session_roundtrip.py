@@ -1,5 +1,4 @@
 import asyncio
-import os
 import threading
 from pathlib import Path
 from typing import Awaitable
@@ -20,8 +19,6 @@ from tests.websocket_server import (
     sessions,
     start_params,
 )
-
-os.environ.setdefault("AUDIO_WS_URL", "ws://127.0.0.1:8765")
 
 
 class DummyMicrophoneInterface:
