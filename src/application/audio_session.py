@@ -1,12 +1,18 @@
+from __future__ import annotations
+
 import asyncio
-import io
 import time
 import uuid
-import wave
 from typing import Any, Dict, Optional, Tuple
 
 import numpy as np
 
+from application.playback_pipeline import PlaybackFormatSupport, PlaybackPipeline
+from domain.session_contracts import (
+    SERVER_DRIVEN_EVENT_TYPES,
+    SessionBinding,
+    SessionPhase,
+)
 from dto.audio_message import MAX_AUDIO_ARRAY_BYTES, base64_to_np
 from exceptions.audio_exceptions import AudioError
 from infrastructure.websocket_client import AudioWebSocketClient
@@ -15,53 +21,66 @@ from infrastructure.websocket_client import AudioWebSocketClient
 class AudioSession:
     MAX_JSON_AUDIO_BYTES = MAX_AUDIO_ARRAY_BYTES
     MAX_PLAYBACK_FILE_BYTES = 16 * 1024 * 1024
-    MAX_CHANNELS = 8
-    MAX_SAMPLE_RATE = 192000
+    MAX_CHANNELS = PlaybackFormatSupport.MAX_CHANNELS
+    MAX_SAMPLE_RATE = PlaybackFormatSupport.MAX_SAMPLE_RATE
 
     def __init__(self, ws: AudioWebSocketClient, mic_adapter, spk_adapter):
         self.ws = ws
         self.mic = mic_adapter
         self.spk = spk_adapter
-        self.session_id = str(uuid.uuid4())
-        self._queue = asyncio.Queue()
+
+        self._session_id = str(uuid.uuid4())
+        self._binding = SessionBinding(client_session_id=self._session_id)
+        self._phase = SessionPhase.IDLE
+
+        self._queue: "asyncio.Queue[Optional[np.ndarray]]" = asyncio.Queue()
         self._playback_finished = False
-        self._playback_meta: Optional[Dict[str, Any]] = None
-        self._pending_playback_files: int = 0
-        self._playback_session_active: bool = (
-            False  # wrapper: playback.start -> playback.end
-        )
+        self._pending_playback_files = 0
+        self._playback_session_active = False
         self._final_event_received = False
-        self._last_activity: float = time.monotonic()
+        self._last_activity = time.monotonic()
         self._playback_complete_event: Optional[asyncio.Event] = None
+        self._target_playback_sample_rate = 16000
+        self._playback_pipeline = PlaybackPipeline(
+            target_sample_rate=self._target_playback_sample_rate,
+            max_file_bytes=self.MAX_PLAYBACK_FILE_BYTES,
+        )
+
         ws._on_receive = self._on_receive
         ws._on_receive_binary = self._on_binary
 
-    # CHANGED: ensure a consistent 16 kHz processing rate across playback paths
-    # by providing a small linear resampler used when server-provided audio
-    # differs from 16000 Hz. This keeps downstream speaker assumptions intact.
+    @property
+    def session_id(self) -> str:
+        return self._session_id
+
+    @session_id.setter
+    def session_id(self, value: str) -> None:
+        normalized = str(value or "").strip() or str(uuid.uuid4())
+        self._session_id = normalized
+        self._binding.client_session_id = normalized
+
+    @property
+    def active_session_id(self) -> str:
+        return self._binding.active_session_id
+
+    @property
+    def server_session_id(self) -> Optional[str]:
+        return self._binding.server_session_id
+
+    @property
+    def phase(self) -> SessionPhase:
+        return self._phase
+
     def _resample(
         self, arr: np.ndarray, src_rate: float, dst_rate: float
     ) -> np.ndarray:
-        if not isinstance(arr, np.ndarray) or arr.size == 0:
-            return arr
-        if src_rate == dst_rate:
-            return arr
-        ratio = float(dst_rate) / float(src_rate)
-        dst_len = max(1, int(round(arr.shape[0] * ratio)))
-        orig_positions = np.linspace(0.0, 1.0, arr.shape[0], endpoint=False)
-        new_positions = np.linspace(0.0, 1.0, dst_len, endpoint=False)
-        # Ensure 2D (frames, channels)
-        if arr.ndim == 1:
-            arr = arr.reshape(-1, 1)
-        resampled = np.empty((dst_len, arr.shape[1]), dtype=np.float32)
-        for idx in range(arr.shape[1]):
-            resampled[:, idx] = np.interp(new_positions, orig_positions, arr[:, idx])
-        return resampled.astype(np.float32)
+        return PlaybackFormatSupport.resample(arr, src_rate, dst_rate)
 
     async def _on_receive(self, msg):
         self._last_activity = time.monotonic()
-        if msg.session_id not in {None, self.session_id}:
+        if not self._accepts_message(msg):
             return
+
         if msg.type == "audio_chunk":
             try:
                 data = base64_to_np(
@@ -70,12 +89,12 @@ class AudioSession:
                     msg.shape,
                     max_decoded_bytes=self.MAX_JSON_AUDIO_BYTES,
                 )
-            except Exception as exc:
-                print(
-                    f"[Session {self.session_id}] Ignoring malformed audio_chunk payload: {exc}"
-                )
+            except Exception:
                 return
-            await self._queue.put(data)
+            self._phase = SessionPhase.PLAYING
+            await self._queue_audio(np.asarray(data, dtype=np.float32))
+        elif msg.type == "response.start":
+            self._phase = SessionPhase.WAITING_RESPONSE
         elif msg.type == "playback_file_start":
             await self._handle_playback_start(msg)
         elif msg.type == "playback_file_done":
@@ -86,21 +105,16 @@ class AudioSession:
             "final",
             "tts_complete",
             "response.end",
+            "playback_stopped",
+            "stop_playback",
         }:
             self._final_event_received = True
             await self._maybe_complete_playback()
-        elif msg.type == "playback.queue_status":
-            # Informational: don't finish session based on generation_done alone.
-            # The server sends playback_file_start/done for actual audio, and
-            # may send playback.end or response.end when the turn is complete.
-            pass
         elif msg.type == "playback.start":
             self._playback_session_active = True
+            self._phase = SessionPhase.PLAYING
         elif msg.type == "playback.end":
             self._playback_session_active = False
-            self._final_event_received = True
-            await self._maybe_complete_playback()
-        elif msg.type in {"playback_stopped", "stop_playback"}:
             self._final_event_received = True
             await self._maybe_complete_playback()
 
@@ -109,24 +123,42 @@ class AudioSession:
         timeout: Optional[float] = None,
         playback_timeout: Optional[float] = None,
     ):
-        print(f"[Session {self.session_id}] Started")
+        print(f"[Session {self.active_session_id}] Started")
+        self._phase = SessionPhase.CONNECTING
+
+        sample_rate = int(getattr(self.mic.mic, "samplerate", 16000) or 16000)
+        chunk_frames = int(getattr(self.mic.mic, "blocksize", 1024) or 1024)
+        channels = int(getattr(self.mic.mic, "channels", 1) or 1)
+        self._target_playback_sample_rate = int(
+            getattr(getattr(self.spk, "spk", None), "samplerate", sample_rate)
+            or sample_rate
+        )
+        self._playback_pipeline = PlaybackPipeline(
+            target_sample_rate=self._target_playback_sample_rate,
+            max_file_bytes=self.MAX_PLAYBACK_FILE_BYTES,
+        )
+        self.ws.configure_stream(
+            sample_rate=sample_rate,
+            chunk_frames=chunk_frames,
+            channels=channels,
+            sampwidth=2,
+        )
         await self.ws.connect()
         self._playback_finished = False
-        self._playback_meta = None
         self._pending_playback_files = 0
+        self._playback_session_active = False
         self._final_event_received = False
         self._playback_complete_event = asyncio.Event()
-        # Prepare server-side stream if binary protocol is used
+        self._phase = SessionPhase.RECORDING
         try:
             await self.ws.prepare_stream(
                 self.session_id,
-                sample_rate=getattr(self.mic.mic, "samplerate", 16000),
-                chunk_frames=getattr(self.mic.mic, "blocksize", 1024),
-                channels=getattr(self.mic.mic, "channels", 1),
+                sample_rate=sample_rate,
+                chunk_frames=chunk_frames,
+                channels=channels,
                 sampwidth=2,
             )
         except AttributeError:
-            # Older client without prepare_stream or non-binary mode
             pass
         reset_speaker = getattr(self.spk, "reset", None)
         if callable(reset_speaker):
@@ -139,6 +171,7 @@ class AudioSession:
             self.mic.mic.start_recording()
         except Exception:
             self.spk.spk.stop_output()
+            self._phase = SessionPhase.ERROR
             raise
 
         sender = asyncio.create_task(self._send_loop())
@@ -148,10 +181,8 @@ class AudioSession:
                 if timeout is not None:
                     await asyncio.wait_for(self._recording_done(), timeout)
                 else:
-                    # Wait indefinitely until recording is stopped by user
                     await self._recording_done()
             except asyncio.TimeoutError:
-                # Timed recording window elapsed; proceed to stop
                 pass
         except Exception as exc:  # pragma: no cover - unexpected flow
             run_error = exc
@@ -159,11 +190,13 @@ class AudioSession:
             self.mic.mic.stop_recording()
 
         try:
+            self._phase = SessionPhase.SENDING
             if playback_timeout is not None:
                 await asyncio.wait_for(sender, timeout=playback_timeout)
             else:
                 await sender
         except asyncio.CancelledError:
+            self._phase = SessionPhase.ERROR
             raise
         except asyncio.TimeoutError as exc:
             sender.cancel()
@@ -174,10 +207,10 @@ class AudioSession:
             if run_error is None:
                 run_error = exc
 
-        # Notify the server that input has ended and we are ready for the response
         try:
-            await self.ws.send_control(self.session_id, "end_session")
-            await self.ws.send_playback(self.session_id, mode="background")
+            self._phase = SessionPhase.WAITING_RESPONSE
+            await self.ws.send_control(self.active_session_id, "end_session")
+            await self.ws.send_playback(self.active_session_id, mode="background")
         except Exception as exc:
             if run_error is None:
                 run_error = exc
@@ -200,14 +233,17 @@ class AudioSession:
                             and (now - self._last_activity) > idle_limit
                         ):
                             print(
-                                f"[Session {self.session_id}] playback idle > {idle_limit}s; stopping"
+                                f"[Session {self.active_session_id}] playback idle > {idle_limit}s; stopping"
                             )
+                            self._final_event_received = True
+                            await self._maybe_complete_playback()
                             break
                         continue
                     if data is None:
                         break
+                    self._phase = SessionPhase.PLAYING
                     await self.spk.play(data)
-                print(f"[Session {self.session_id}] Completed")
+                print(f"[Session {self.active_session_id}] Completed")
         finally:
             flush_playback = getattr(self.spk, "flush", None)
             if callable(flush_playback):
@@ -224,6 +260,12 @@ class AudioSession:
                         pass
                 except Exception:
                     pass
+            try:
+                await self._await_speaker_drain(
+                    timeout=self._speaker_drain_timeout(playback_timeout)
+                )
+            except Exception:
+                pass
             self.spk.spk.stop_output()
             if (
                 run_error is not None
@@ -233,159 +275,55 @@ class AudioSession:
                 self._playback_complete_event.set()
 
         if run_error is not None:
+            self._phase = SessionPhase.ERROR
             raise run_error
+        self._phase = SessionPhase.COMPLETED
 
     async def _send_loop(self):
-        # Stream while recording is active
         while self.mic.mic.is_recording:
             samples = await self.mic.get_samples()
             if samples is not None:
-                await self.ws.send_audio_chunk(self.session_id, samples)
-        # After recording stops, drain any remaining buffered frames briefly
+                await self.ws.send_audio_chunk(self.active_session_id, samples)
         idle_after_stop = 0
-        max_idle_iters = 100  # ~1s given MicrophoneAsyncAdapter sleep of 10ms
+        max_idle_iters = 100
         while idle_after_stop < max_idle_iters:
             samples = await self.mic.get_samples()
             if samples is None:
                 idle_after_stop += 1
                 continue
             idle_after_stop = 0
-            await self.ws.send_audio_chunk(self.session_id, samples)
-        print(f"[Session {self.session_id}] Sender finished")
+            await self.ws.send_audio_chunk(self.active_session_id, samples)
+        print(f"[Session {self.active_session_id}] Sender finished")
 
     async def _recording_done(self):
         while self.mic.mic.is_recording:
             await asyncio.sleep(0.05)
 
     async def _handle_playback_start(self, msg):
-        print(f"[Session {self.session_id}] playback_file_start received")
-        extra = msg.extra or {}
-        file_field = extra.get("file")
-        params = extra.get("params") if isinstance(extra.get("params"), dict) else {}
-        # Merge metadata from both top-level and nested structures to be robust
-        meta_srcs = []
-        if isinstance(file_field, dict):
-            meta_srcs.append(file_field)
-        if isinstance(extra, dict):
-            meta_srcs.append(extra)
-        if isinstance(params, dict):
-            meta_srcs.append(params)
-
-        def _first(key, default=None):
-            for src in meta_srcs:
-                val = src.get(key)
-                if val is not None:
-                    return val
-            return default
-
-        playback_format = str(_first("format", "pcm")).lower()
-        # Try to extract a stable message identifier for ACKs
-        message_id = extra.get("message_id") or extra.get("utterance_id")
-        if not message_id:
-            if isinstance(file_field, dict):
-                message_id = (
-                    file_field.get("file")
-                    or file_field.get("path")
-                    or file_field.get("name")
-                )
-            elif isinstance(file_field, str):
-                message_id = file_field
-        if not message_id:
-            # Fallback to composite id
-            turn_id = extra.get("turn_id") or "turn"
-            idx = extra.get("utterance_index")
-            message_id = f"{turn_id}:{idx if idx is not None else '0'}"
-        if playback_format == "wav":
-            self._playback_meta = {
-                "format": "wav",
-                "buffer": bytearray(),
-                "message_id": message_id,
-                "bytes_received": 0,
-                "max_bytes": self.MAX_PLAYBACK_FILE_BYTES,
-                "dropped": False,
-            }
-            self._pending_playback_files += 1
-            print(f"[Session {self.session_id}] Playback format=wav")
+        state = self._playback_pipeline.start_file(msg.extra or {})
+        if state is None:
             return
-        if playback_format != "pcm":
-            # Default to PCM if unspecified or unknown to avoid dropping audio
-            playback_format = "pcm"
-
-        try:
-            sample_rate = int(_first("sample_rate", 16000))
-            channels = int(_first("channels", 1))
-            # Accept sampwidth or bit_depth_bytes synonyms
-            sampwidth = int(_first("sampwidth", _first("bit_depth_bytes", 2)))
-        except (TypeError, ValueError):
-            print(f"[Session {self.session_id}] Invalid playback metadata; skipping file")
-            self._playback_meta = None
-            return
-        pcm_format = str(_first("pcm_format", "s16le")).lower()
-
-        pcm_meta = self._build_pcm_meta(
-            channels=channels,
-            sampwidth=sampwidth,
-            pcm_format=pcm_format,
-            sample_rate=sample_rate,
-        )
-        if pcm_meta is None:
-            print("[Session] Unsupported PCM format; skipping playback")
-            self._playback_meta = None
-            return
-        pcm_meta["message_id"] = message_id
-        self._playback_meta = pcm_meta
         self._pending_playback_files += 1
-        print(
-            f"[Session {self.session_id}] Playback format=pcm sr={sample_rate} ch={channels} sw={sampwidth}"
-        )
+        self._phase = SessionPhase.PLAYING
 
     async def _handle_playback_done(self):
-        meta = self._playback_meta
-        if not meta:
-            return
-        if meta.get("format") == "wav" and not meta.get("dropped"):
-            await self._flush_wav_buffer(meta.get("buffer", bytearray()))
-        elif meta.get("dropped"):
-            print(
-                f"[Session {self.session_id}] Dropped oversized playback payload "
-                f"reason={meta.get('drop_reason', 'size_limit')}"
-            )
-        self._playback_meta = None
+        result = self._playback_pipeline.finish_file()
+        if result.audio is not None:
+            await self._queue_audio(result.audio)
         if self._pending_playback_files > 0:
             self._pending_playback_files -= 1
-        print(
-            f"[Session {self.session_id}] playback_file_done (remaining={self._pending_playback_files})"
+        await self._maybe_send_playback_ack(
+            result.message_id,
+            status="dropped" if result.dropped else "played",
         )
-        # Try to send playback ACK after we have likely played queued blocks
-        await self._maybe_send_playback_ack(meta)
         await self._maybe_complete_playback()
 
     async def _on_binary(self, payload: bytes):
         self._last_activity = time.monotonic()
-        meta = self._playback_meta
-        if not meta or not payload:
-            return
-        fmt = meta.get("format", "pcm")
-        if fmt == "wav":
-            max_bytes = int(meta.get("max_bytes", self.MAX_PLAYBACK_FILE_BYTES))
-            received = int(meta.get("bytes_received", 0))
-            next_size = received + len(payload)
-            if next_size > max_bytes:
-                meta["dropped"] = True
-                meta["drop_reason"] = "size_limit"
-                return
-            meta.setdefault("buffer", bytearray()).extend(payload)
-            meta["bytes_received"] = next_size
-            return
-        if len(payload) > self.MAX_PLAYBACK_FILE_BYTES:
-            return
-        arr = self._decode_pcm_bytes(payload, meta)
-        if arr is not None:
-            # CHANGED: enforce 16 kHz processing; resample incoming PCM if needed
-            src_rate = int(meta.get("sample_rate", 16000))
-            if src_rate != 16000:
-                arr = self._resample(arr, src_rate, 16000)
-            await self._queue.put(arr)
+        result = self._playback_pipeline.feed_binary(payload)
+        if result.audio is not None:
+            self._phase = SessionPhase.PLAYING
+            await self._queue_audio(result.audio)
 
     def _build_pcm_meta(
         self,
@@ -395,134 +333,103 @@ class AudioSession:
         pcm_format: str,
         sample_rate: int,
     ) -> Optional[Dict[str, Any]]:
-        channels = int(channels)
-        sample_rate = int(sample_rate)
-        sampwidth = int(sampwidth)
-        if channels < 1 or channels > self.MAX_CHANNELS:
-            return None
-        if sample_rate < 1000 or sample_rate > self.MAX_SAMPLE_RATE:
-            return None
-        if sampwidth not in {1, 2, 4}:
-            return None
-        signed, endian = self._parse_pcm_format(pcm_format, sampwidth)
-        dtype = self._resolve_pcm_dtype(sampwidth, signed, endian)
-        if dtype is None:
-            return None
-        scale, offset = self._pcm_scale_offset(sampwidth, signed)
-        return {
-            "format": "pcm",
-            "dtype": dtype,
-            "scale": scale,
-            "offset": offset,
-            "channels": max(1, int(channels)),
-            "sample_rate": int(sample_rate),
-            "sampwidth": int(sampwidth),
-            "signed": signed,
-        }
-
-    async def _flush_wav_buffer(self, buffer: bytearray) -> None:
-        if not buffer:
-            return
-        try:
-            with wave.open(io.BytesIO(bytes(buffer)), "rb") as wav_reader:
-                channels = wav_reader.getnchannels()
-                sampwidth = wav_reader.getsampwidth()
-                sample_rate = wav_reader.getframerate()
-                frame_count = wav_reader.getnframes()
-                raw = wav_reader.readframes(frame_count)
-        except wave.Error as exc:
-            print(f"[Session] Failed to decode WAV playback: {exc}")
-            return
-        fmt = "u8" if sampwidth == 1 else f"s{8 * sampwidth}le"
-        pcm_meta = self._build_pcm_meta(
+        return PlaybackFormatSupport.build_pcm_meta(
             channels=channels,
             sampwidth=sampwidth,
-            pcm_format=fmt,
+            pcm_format=pcm_format,
             sample_rate=sample_rate,
         )
-        if pcm_meta is None:
-            print("[Session] Unsupported WAV PCM parameters; skipping playback")
+
+    async def _flush_wav_buffer(self, buffer: bytearray) -> None:
+        decoded = PlaybackFormatSupport.decode_wav_bytes(bytes(buffer))
+        if decoded is None:
             return
-        arr = self._decode_pcm_bytes(raw, pcm_meta)
-        if arr is not None:
-            # CHANGED: enforce 16 kHz processing; resample WAV payloads if needed
-            if int(sample_rate) != 16000:
-                arr = self._resample(arr, int(sample_rate), 16000)
-            await self._queue.put(arr)
+        arr, wav_meta = decoded
+        if int(wav_meta["sample_rate"]) != self._target_playback_sample_rate:
+            arr = self._resample(
+                arr,
+                float(wav_meta["sample_rate"]),
+                float(self._target_playback_sample_rate),
+            )
+        await self._queue_audio(arr)
 
     def _decode_pcm_bytes(
         self, payload: bytes, meta: Dict[str, Any]
     ) -> Optional[np.ndarray]:
-        if not payload:
-            return None
-        if len(payload) > self.MAX_PLAYBACK_FILE_BYTES:
-            return None
-        dtype = meta.get("dtype")
-        channels = int(meta.get("channels", 1))
-        if dtype is None:
-            return None
-        try:
-            arr = np.frombuffer(payload, dtype=dtype)
-        except ValueError:
-            return None
-        if channels > 1:
-            frame_count = arr.size // channels
-            if frame_count == 0:
-                return None
-            arr = arr[: frame_count * channels].reshape(frame_count, channels)
-        else:
-            arr = arr.reshape(-1, 1)
-        arr = arr.astype(np.float32)
-        offset = float(meta.get("offset", 0.0))
-        if offset:
-            arr = arr - offset
-        scale = float(meta.get("scale") or 1.0)
-        if scale:
-            arr = arr / scale
-        return arr
+        return PlaybackFormatSupport.decode_pcm_bytes(
+            payload,
+            dtype=meta.get("dtype"),
+            channels=int(meta.get("channels", 1)),
+            offset=float(meta.get("offset", 0.0)),
+            scale=float(meta.get("scale") or 1.0),
+            sample_kind=str(meta.get("sample_kind") or "int"),
+        )
 
     async def _maybe_complete_playback(self) -> None:
         if self._playback_finished:
             return
         if self._pending_playback_files > 0:
             return
-        if self._playback_meta is not None:
+        if self._playback_pipeline.current_file is not None:
             return
         if not self._final_event_received:
             return
         self._playback_finished = True
+        self._phase = SessionPhase.COMPLETED
         await self._queue.put(None)
         if self._playback_complete_event and not self._playback_complete_event.is_set():
             self._playback_complete_event.set()
 
-    async def _maybe_send_playback_ack(self, meta: Dict[str, Any]) -> None:
-        message_id = meta.get("message_id")
+    async def _maybe_send_playback_ack(
+        self, message_id: Optional[str], status: str = "played"
+    ) -> None:
         if not message_id:
             return
-        status = "dropped" if meta.get("dropped") else "played"
-        # Best-effort: wait briefly for speaker queue to drain before ACK
         try:
-            await self._await_speaker_drain(timeout=3.0)
+            await self._await_speaker_drain(timeout=self._speaker_drain_timeout(None))
         except Exception:
             pass
         try:
             await self.ws.send_playback_ack(
-                self.session_id, message_id, status=status
+                self.active_session_id, message_id, status=status
             )
         except Exception:
-            # Non-fatal
             pass
 
+    async def _queue_audio(self, audio: np.ndarray) -> None:
+        arr = np.asarray(audio, dtype=np.float32)
+        if arr.ndim == 1:
+            arr = arr.reshape(-1, 1)
+        await self._queue.put(arr)
+
+    def _accepts_message(self, msg) -> bool:
+        session_id = getattr(msg, "session_id", None)
+        if session_id in {None, ""}:
+            return True
+        if self._binding.matches(session_id):
+            return True
+        if getattr(msg, "type", None) in SERVER_DRIVEN_EVENT_TYPES:
+            self._binding.bind(session_id)
+            return self._binding.matches(session_id)
+        return False
+
     async def _await_speaker_drain(self, timeout: float = 3.0) -> None:
-        # Poll speaker queue until empty or timeout
-        # SpeakerInterface exposes pending_blocks(); fallback no-op if missing
+        get_pending_frames = getattr(self.spk.spk, "pending_frames", None)
         get_pending = getattr(self.spk.spk, "pending_blocks", None)
-        if not callable(get_pending):
+        if not callable(get_pending_frames) and not callable(get_pending):
             await asyncio.sleep(0)
             return
-        deadline = asyncio.get_running_loop().time() + timeout
-        while get_pending() > 0 and asyncio.get_running_loop().time() < deadline:
+        loop = asyncio.get_running_loop()
+        deadline = loop.time() + timeout
+        while loop.time() < deadline:
+            if callable(get_pending_frames):
+                remaining = int(get_pending_frames())
+            else:
+                remaining = int(get_pending()) if callable(get_pending) else 0
+            if remaining <= 0:
+                break
             await asyncio.sleep(0.05)
+        await asyncio.sleep(self._speaker_tail_seconds())
 
     async def wait_for_playback_completion(
         self, timeout: Optional[float] = None
@@ -551,40 +458,103 @@ class AudioSession:
                 return False
         return True
 
-    @staticmethod
-    def _parse_pcm_format(pcm_format: str, sampwidth: int) -> Tuple[bool, str]:
-        fmt = (pcm_format or "").strip().lower()
-        signed = True
-        endian = "<"
-        if fmt.startswith("u"):
-            signed = False
-        elif fmt.startswith("s"):
-            signed = True
-        else:
-            if sampwidth == 1:
-                signed = False
-        if fmt.endswith("be"):
-            endian = ">"
-        elif fmt.endswith("le"):
-            endian = "<"
-        return signed, endian
+    def _speaker_tail_seconds(self) -> float:
+        speaker = getattr(self.spk, "spk", None)
+        if speaker is None:
+            return 0.05
+        try:
+            blocksize = int(getattr(speaker, "blocksize", 1024))
+            samplerate = float(getattr(speaker, "samplerate", 16000))
+        except (TypeError, ValueError):
+            return 0.05
+        if blocksize <= 0 or samplerate <= 0:
+            return 0.05
+        return min(0.25, max(0.05, blocksize / samplerate))
+
+    def _speaker_drain_timeout(self, playback_timeout: Optional[float]) -> float:
+        base_timeout = 10.0
+        if playback_timeout is not None:
+            base_timeout = max(base_timeout, float(playback_timeout))
+        speaker = getattr(self.spk, "spk", None)
+        if speaker is None:
+            return base_timeout
+        get_pending_frames = getattr(speaker, "pending_frames", None)
+        if not callable(get_pending_frames):
+            return base_timeout
+        try:
+            pending_frames = int(get_pending_frames())
+            samplerate = float(getattr(speaker, "samplerate", 16000))
+        except (TypeError, ValueError):
+            return base_timeout
+        if pending_frames <= 0 or samplerate <= 0:
+            return base_timeout
+        estimated = (pending_frames / samplerate) + self._speaker_tail_seconds() + 0.5
+        return max(base_timeout, estimated)
 
     @staticmethod
-    def _resolve_pcm_dtype(sampwidth: int, signed: bool, endian: str):
-        if sampwidth == 1:
-            return np.int8 if signed else np.uint8
-        if sampwidth == 2:
-            code = "i2" if signed else "u2"
-            return np.dtype(f"{endian}{code}")
-        if sampwidth == 4:
-            code = "i4" if signed else "u4"
-            return np.dtype(f"{endian}{code}")
-        return None
+    def _normalized_format_token(value: Optional[str]) -> str:
+        return PlaybackFormatSupport.normalized_format_token(value)
+
+    @classmethod
+    def _is_wav_format(cls, value: Optional[str]) -> bool:
+        return PlaybackFormatSupport.is_wav_format(value)
+
+    @classmethod
+    def _looks_like_pcm_descriptor(cls, value: Optional[str]) -> bool:
+        return PlaybackFormatSupport.looks_like_pcm_descriptor(value)
+
+    @classmethod
+    def _resolve_pcm_format(
+        cls,
+        *,
+        raw_format: Optional[str],
+        explicit_pcm_format: Optional[str],
+        sample_format: Optional[str],
+        encoding: Optional[str],
+        codec: Optional[str],
+    ) -> str:
+        return PlaybackFormatSupport.resolve_pcm_format(
+            raw_format=raw_format,
+            explicit_pcm_format=explicit_pcm_format,
+            sample_format=sample_format,
+            encoding=encoding,
+            codec=codec,
+        )
+
+    @classmethod
+    def _resolve_playback_sampwidth(
+        cls,
+        *,
+        explicit_sampwidth,
+        pcm_format: str,
+        channels: int,
+        frame_size,
+    ) -> int:
+        return PlaybackFormatSupport.resolve_playback_sampwidth(
+            explicit_sampwidth=explicit_sampwidth,
+            pcm_format=pcm_format,
+            channels=channels,
+            frame_size=frame_size,
+        )
 
     @staticmethod
-    def _pcm_scale_offset(sampwidth: int, signed: bool) -> Tuple[float, float]:
-        if signed:
-            scale = float(2 ** (8 * sampwidth - 1) - 1)
-            return scale, 0.0
-        offset = float(2 ** (8 * sampwidth - 1))
-        return float(offset), offset
+    def _infer_sampwidth_from_frame_size(frame_size, channels: int) -> Optional[int]:
+        return PlaybackFormatSupport.infer_sampwidth_from_frame_size(
+            frame_size, channels
+        )
+
+    @classmethod
+    def _infer_sampwidth_from_pcm_format(cls, pcm_format: str) -> Optional[int]:
+        return PlaybackFormatSupport.infer_sampwidth_from_pcm_format(pcm_format)
+
+    @classmethod
+    def _parse_pcm_format(cls, pcm_format: str, sampwidth: int) -> Tuple[str, str]:
+        return PlaybackFormatSupport.parse_pcm_format(pcm_format, sampwidth)
+
+    @staticmethod
+    def _resolve_pcm_dtype(sampwidth: int, sample_kind: str, endian: str):
+        return PlaybackFormatSupport.resolve_pcm_dtype(sampwidth, sample_kind, endian)
+
+    @staticmethod
+    def _pcm_scale_offset(sampwidth: int, sample_kind: str) -> Tuple[float, float]:
+        return PlaybackFormatSupport.pcm_scale_offset(sampwidth, sample_kind)

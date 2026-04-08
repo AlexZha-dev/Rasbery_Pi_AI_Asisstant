@@ -76,12 +76,19 @@ async def handle_client(ws):
                 sample_rate = int(data.get("sample_rate", sample_rate))
                 channels = int(data.get("channels", channels))
                 sampwidth = int(data.get("sampwidth", sampwidth))
-                chunk_size = int(data.get("chunk_size", channels * sampwidth))
+                chunk_size = int(data.get("chunk_size", 0) or 0)
+                chunk_size_bytes = int(
+                    data.get(
+                        "chunk_size_bytes",
+                        chunk_size * channels * sampwidth if chunk_size else 0,
+                    )
+                )
                 start_params[current_session] = {
                     "sample_rate": sample_rate,
                     "channels": channels,
                     "sampwidth": sampwidth,
                     "chunk_size": chunk_size,
+                    "chunk_size_bytes": chunk_size_bytes,
                 }
                 sessions.setdefault(current_session, [])
                 if protocol_mode != "binary":

@@ -9,15 +9,20 @@ import sounddevice as sd
 from exceptions.audio_exceptions import AudioError
 
 
-class SpeakerInterface:
-    """Неблокирующий интерфейс для воспроизведения фиксированных блоков сэмплов.
+def _resolve_default_device_index(defaults, position: int):
+    if defaults is None:
+        return None
+    candidate = defaults
+    try:
+        if not isinstance(defaults, (str, bytes)) and len(defaults) > position:
+            candidate = defaults[position]
+    except TypeError:
+        candidate = defaults
+    return candidate
 
-    API:
-      - play(samples)         # добавляет сэмплы в очередь
-      - start_output()
-      - stop_output()
-      - set_output_device(device) / reset_to_default_device()
-    """
+
+class SpeakerInterface:
+    """Non-blocking speaker output that preserves contiguous PCM playback."""
 
     def __init__(
         self,
@@ -34,10 +39,7 @@ class SpeakerInterface:
         self._last_play_activity: float = 0.0
 
         defaults = sd.default.device
-        if isinstance(defaults, tuple) and len(defaults) >= 2:
-            self._initial_output_device = defaults[1]
-        else:
-            self._initial_output_device = defaults
+        self._initial_output_device = _resolve_default_device_index(defaults, 1)
 
         self._device = self._initial_output_device
         self._play_queue: "queue.Queue[np.ndarray]" = queue.Queue(
@@ -53,6 +55,7 @@ class SpeakerInterface:
         self._started_event = threading.Event()
         self._start_error: Optional[Exception] = None
         self._stream_samplerate: Optional[float] = None
+        self._stream_channels: Optional[int] = None
         self._carryover: Optional[np.ndarray] = None
         self._pending_frames: int = 0
 
@@ -65,51 +68,49 @@ class SpeakerInterface:
             self._device = self._initial_output_device
 
     def play(self, samples: np.ndarray):
-        """Ставим фрейм в очередь воспроизведения. Асинхронное ожидание места реализуется через адаптер."""
         if samples is None:
             return
         if not self.is_playing:
             raise AudioError("Output stream is not started")
-        arr = np.asarray(samples, dtype=self.dtype)
-        if arr.ndim == 1:
-            arr = arr.reshape(-1, 1)
-        stream_rate = self._stream_samplerate or self.samplerate
-        if stream_rate != self.samplerate and arr.size:
-            arr = self._resample(arr, self.samplerate, stream_rate)
-        if arr.shape[0] != self.blocksize:
-            if arr.shape[0] > self.blocksize:
-                arr = arr[: self.blocksize, ...]
-            else:
-                pad = np.zeros(
-                    (self.blocksize - arr.shape[0], arr.shape[1]), dtype=self.dtype
-                )
-                arr = np.concatenate([arr, pad], axis=0)
-        # Блокирующий put в очереди (не дропаем)
+        arr = self._normalize_chunk(samples)
+        if arr.size == 0:
+            return
+        with self._queue_state_lock:
+            self._pending_frames += int(arr.shape[0])
         self._play_queue.put(arr, block=True)
         self._last_play_activity = time.monotonic()
 
     def _output_callback(self, outdata, frames, time_info, status):
-        try:
-            item = self._play_queue.get_nowait()
-            if item.shape[0] >= frames:
-                out_chunk = item[:frames]
-            else:
-                pad = np.zeros(
-                    (frames - item.shape[0], item.shape[1]), dtype=self.dtype
-                )
-                out_chunk = np.concatenate([item, pad], axis=0)
-        except queue.Empty:
-            out_chunk = np.zeros((frames, self.channels), dtype=self.dtype)
+        stream_channels = self._stream_channels or self.channels
+        out_chunk = np.zeros((frames, stream_channels), dtype=self.dtype)
+        filled = 0
 
-        if out_chunk.shape[1] != self.channels:
-            if out_chunk.shape[1] < self.channels:
-                pad = np.zeros(
-                    (out_chunk.shape[0], self.channels - out_chunk.shape[1]),
-                    dtype=self.dtype,
-                )
-                out_chunk = np.concatenate([out_chunk, pad], axis=1)
+        while filled < frames:
+            item = self._carryover
+            if item is None or item.size == 0:
+                try:
+                    item = self._play_queue.get_nowait()
+                except queue.Empty:
+                    self._carryover = None
+                    break
+
+            if item.ndim == 1:
+                item = item.reshape(-1, 1)
+            available = int(item.shape[0])
+            if available <= 0:
+                self._carryover = None
+                continue
+
+            take = min(frames - filled, available)
+            out_chunk[filled : filled + take] = item[:take]
+            filled += take
+            with self._queue_state_lock:
+                self._pending_frames = max(0, self._pending_frames - take)
+
+            if take < available:
+                self._carryover = item[take:]
             else:
-                out_chunk = out_chunk[:, : self.channels]
+                self._carryover = None
 
         outdata[:] = out_chunk
 
@@ -138,9 +139,9 @@ class SpeakerInterface:
                 device = self._device
             try:
                 self._stream = self._open_stream(device, self.samplerate)
-            except Exception as e:
+            except Exception as exc:
                 self._stream = None
-                self._start_error = AudioError(f"Unable to open output stream: {e}")
+                self._start_error = AudioError(f"Unable to open output stream: {exc}")
                 self._started_event.set()
                 return
 
@@ -149,6 +150,9 @@ class SpeakerInterface:
                 self._is_playing = True
                 self._stream_samplerate = getattr(
                     self._stream, "samplerate", self.samplerate
+                )
+                self._stream_channels = int(
+                    getattr(self._stream, "channels", self.channels) or self.channels
                 )
             self._started_event.set()
             while not self._stop_event.is_set():
@@ -167,6 +171,7 @@ class SpeakerInterface:
             self._started_event.set()
             with self._lock:
                 self._stream_samplerate = None
+                self._stream_channels = None
 
     def stop_output(self):
         with self._lock:
@@ -184,6 +189,9 @@ class SpeakerInterface:
             return self._is_playing
 
     def _drain_queue(self) -> None:
+        self._carryover = None
+        with self._queue_state_lock:
+            self._pending_frames = 0
         while True:
             try:
                 self._play_queue.get_nowait()
@@ -191,11 +199,14 @@ class SpeakerInterface:
                 return
 
     def pending_blocks(self) -> int:
-        """Approximate number of audio blocks pending in output queue."""
-        return self._play_queue.qsize()
+        carry = 1 if self._carryover is not None and self._carryover.size else 0
+        return self._play_queue.qsize() + carry
+
+    def pending_frames(self) -> int:
+        with self._queue_state_lock:
+            return max(0, int(self._pending_frames))
 
     def had_recent_activity(self, window: float = 0.75) -> bool:
-        """Return True if play() was invoked within the last *window* seconds."""
         if self._last_play_activity == 0.0:
             return False
         return (time.monotonic() - self._last_play_activity) <= max(window, 0.0)
@@ -209,6 +220,7 @@ class SpeakerInterface:
         self._drain_queue()
         with self._lock:
             self._stream_samplerate = None
+            self._stream_channels = None
 
     def _resolve_default_samplerate(self, device) -> Optional[float]:
         try:
@@ -218,13 +230,27 @@ class SpeakerInterface:
         except Exception:
             return None
 
+    def _resolve_output_channels(self, device) -> int:
+        target = max(1, int(self.channels or 1))
+        try:
+            info = sd.query_devices(device, "output")
+            max_output_channels = int(info.get("max_output_channels") or 0)
+        except Exception:
+            return target
+        if max_output_channels <= 0:
+            return target
+        if target == 1 and max_output_channels >= 2:
+            return 2
+        return max(1, min(target, max_output_channels))
+
     def _open_stream(self, device, samplerate: float) -> sd.OutputStream:
+        channels = self._resolve_output_channels(device)
         try:
             stream = sd.OutputStream(
                 samplerate=samplerate,
                 blocksize=self.blocksize,
                 dtype=self.dtype,
-                channels=self.channels,
+                channels=channels,
                 callback=self._output_callback,
                 device=device,
             )
@@ -237,7 +263,7 @@ class SpeakerInterface:
                         samplerate=fallback,
                         blocksize=self.blocksize,
                         dtype=self.dtype,
-                        channels=self.channels,
+                        channels=channels,
                         callback=self._output_callback,
                         device=device,
                     )
@@ -251,10 +277,30 @@ class SpeakerInterface:
             return arr
         ratio = dst_rate / src_rate
         dst_len = max(1, int(round(arr.shape[0] * ratio)))
-        # quick linear interpolation per channel
         orig_positions = np.linspace(0.0, 1.0, arr.shape[0], endpoint=False)
         new_positions = np.linspace(0.0, 1.0, dst_len, endpoint=False)
         resampled = np.empty((dst_len, arr.shape[1]), dtype=np.float32)
         for idx in range(arr.shape[1]):
             resampled[:, idx] = np.interp(new_positions, orig_positions, arr[:, idx])
         return resampled.astype(self.dtype)
+
+    def _normalize_chunk(self, samples: np.ndarray) -> np.ndarray:
+        arr = np.asarray(samples, dtype=self.dtype)
+        if arr.ndim == 1:
+            arr = arr.reshape(-1, 1)
+        stream_rate = self._stream_samplerate or self.samplerate
+        stream_channels = self._stream_channels or self.channels
+        if stream_rate != self.samplerate and arr.size:
+            arr = self._resample(arr, self.samplerate, stream_rate)
+        if arr.shape[1] != stream_channels:
+            if arr.shape[1] == 1 and stream_channels > 1:
+                arr = np.repeat(arr, stream_channels, axis=1)
+            elif arr.shape[1] < stream_channels:
+                pad = np.zeros(
+                    (arr.shape[0], stream_channels - arr.shape[1]),
+                    dtype=self.dtype,
+                )
+                arr = np.concatenate([arr, pad], axis=1)
+            else:
+                arr = arr[:, :stream_channels]
+        return arr

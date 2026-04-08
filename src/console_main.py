@@ -2,35 +2,23 @@ from __future__ import annotations
 
 import asyncio
 
-from application.audio_session import AudioSession
 from application.session_runner import SessionRunner
+from bootstrap.runtime import create_client_runtime
 from controllers.console_controller import ConsoleController
 from infrastructure.button_interface import ButtonInterface
-from infrastructure.device_registry import DeviceRegistry
-from infrastructure.microphone_interface import MicrophoneInterface
-from infrastructure.sounds_adapters import (
-    MicrophoneAsyncAdapter,
-    SpeakerAsyncAdapter,
-)
-from infrastructure.speaker_interface import SpeakerInterface
-from infrastructure.websocket_client import AudioWebSocketClient
 from ui.lcd_view import LCDView
 
 
 async def main() -> None:
-    microphone = MicrophoneInterface(samplerate=16000, channels=1, blocksize=1024)
-    speaker = SpeakerInterface(samplerate=16000, channels=1, blocksize=1024)
-    mic_adapter = MicrophoneAsyncAdapter(microphone)
-    spk_adapter = SpeakerAsyncAdapter(speaker)
-    registry = DeviceRegistry()
+    runtime = create_client_runtime(sample_rate=16000, channels=1, blocksize=1024)
+    microphone = runtime.microphone
+    speaker = runtime.speaker
+    registry = runtime.registry
 
     def session_factory():
-        ws_client = AudioWebSocketClient()
-        session = AudioSession(ws_client, mic_adapter, spk_adapter)
-        return session, ws_client
+        return runtime.create_session()
 
     def request_stop():
-        # Stop only microphone; keep speaker running to play server response
         microphone.stop_recording()
 
     runner = SessionRunner(
@@ -53,7 +41,7 @@ async def main() -> None:
         await controller.run()
     finally:
         button.close()
-        spk_adapter.close()
+        runtime.speaker_adapter.close()
     print("[Console] Console shutdown complete.")
 
 

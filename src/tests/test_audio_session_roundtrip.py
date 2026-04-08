@@ -1,5 +1,6 @@
 import asyncio
 import threading
+import uuid
 from pathlib import Path
 from typing import Awaitable
 
@@ -65,6 +66,18 @@ class DummySpeakerInterface:
             self.frames.append(np.asarray(samples))
 
 
+async def unlink_with_retry(path: Path, attempts: int = 10, delay: float = 0.05) -> bool:
+    for _ in range(attempts):
+        if not path.exists():
+            return True
+        try:
+            path.unlink()
+            return True
+        except PermissionError:
+            await asyncio.sleep(delay)
+    return not path.exists()
+
+
 @pytest_asyncio.fixture
 async def audio_test_server(monkeypatch, mode):
     # Switch between legacy JSON endpoint and binary '/ws/audio'
@@ -74,16 +87,17 @@ async def audio_test_server(monkeypatch, mode):
         url = "ws://127.0.0.1:8765"
     monkeypatch.setenv("AUDIO_WS_URL", url)
     monkeypatch.setattr(audio_config, "AUDIO_WS_URL", url)
-    target = Path(OUTPUT_DIR) / "test-session.wav"
+    session_id = f"test-session-{mode}-{uuid.uuid4().hex[:8]}"
+    target = Path(OUTPUT_DIR) / f"{session_id}.wav"
     if target.exists():
-        target.unlink()
+        await unlink_with_retry(target)
 
     try:
         server = await websockets.serve(handle_client, "127.0.0.1", 8765, max_size=None)
     except OSError as exc:  # pragma: no cover - sandboxed CI without socket perms
         pytest.skip(f"Unable to start local websocket test server: {exc}")
     try:
-        yield target, url
+        yield target, url, session_id
     finally:
         server.close()
         await server.wait_closed()
@@ -91,7 +105,7 @@ async def audio_test_server(monkeypatch, mode):
         start_params.clear()
         playback_acks.clear()
         if target.exists():
-            target.unlink()
+            await unlink_with_retry(target)
 
 
 async def run_with_timeout(coro: Awaitable, seconds: float, stage: str):
@@ -104,7 +118,7 @@ async def run_with_timeout(coro: Awaitable, seconds: float, stage: str):
 @pytest.mark.asyncio
 @pytest.mark.parametrize("mode", ["json", "binary"])  # exercise both protocols
 async def test_audio_session_roundtrip(audio_test_server, mode):
-    target, url = audio_test_server
+    target, url, session_id = audio_test_server
     blocksize = 1024
     samplerate = 16000
     frames = []
@@ -119,7 +133,7 @@ async def test_audio_session_roundtrip(audio_test_server, mode):
     spk_adapter = SpeakerAsyncAdapter(spk)
     ws_client = AudioWebSocketClient(url=url)
     session = AudioSession(ws_client, mic_adapter, spk_adapter)
-    session.session_id = "test-session"
+    session.session_id = session_id
 
     await run_with_timeout(session.run_once(timeout=0.2), 5.0, "session run")
     await run_with_timeout(
@@ -130,8 +144,8 @@ async def test_audio_session_roundtrip(audio_test_server, mode):
     assert ws_client.closed_by_server is False
 
     if mode == "binary":
-        ack_list = playback_acks.get("test-session")
-        assert ack_list, "Expected playback acknowledgment for session 'test-session'"
+        ack_list = playback_acks.get(session_id)
+        assert ack_list, f"Expected playback acknowledgment for session '{session_id}'"
         assert any(
             ack["type"] == "playback_ack"
             and ack["message_id"] == "utt-1"
@@ -146,7 +160,8 @@ async def test_audio_session_roundtrip(audio_test_server, mode):
 
     assert target.exists(), "Websocket server did not persist WAV output"
     if mode == "binary":
-        params = start_params.get("test-session")
+        params = start_params.get(session_id)
         assert params is not None
         expected_chunk_bytes = blocksize * params["channels"] * params["sampwidth"]
-        assert params["chunk_size"] == expected_chunk_bytes
+        assert params["chunk_size"] == blocksize
+        assert params["chunk_size_bytes"] == expected_chunk_bytes

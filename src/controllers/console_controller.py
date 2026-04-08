@@ -14,7 +14,7 @@ from exceptions.audio_exceptions import AudioError
 from infrastructure.button_interface import ButtonInterface
 from infrastructure.device_registry import DeviceRegistry, DeviceSnapshot
 from infrastructure.microphone_interface import MicrophoneInterface
-from infrastructure.speaker_interface import SpeakerInterface
+from infrastructure.speaker_output import SpeakerInterface
 from ui.console_view import ConsoleState, ConsoleView
 from ui.lcd_view import LCDView
 
@@ -92,13 +92,9 @@ class ConsoleController:
             self._button_task = loop.create_task(self._button_listener())
         try:
             while running:
-                self._maybe_refresh_devices()
-                state = self._build_state()
-                self._view.render(state)
-                self._update_lcd_state()
+                state = self._render_state()
                 try:
-                    print("[Console] Awaiting command...")
-                    command = await self._prompt("Command: ")
+                    command = await self._await_command(loop, state)
                 except EOFError:
                     print("[Console] EOF received, exiting.")
                     command = "q"
@@ -126,6 +122,32 @@ class ConsoleController:
     def get_state(self) -> ConsoleState:
         self._maybe_refresh_devices()
         return self._build_state()
+
+    def _render_state(self) -> ConsoleState:
+        self._maybe_refresh_devices()
+        state = self._build_state()
+        self._view.render(state)
+        self._update_lcd_state()
+        return state
+
+    async def _await_command(
+        self,
+        loop: asyncio.AbstractEventLoop,
+        initial_state: ConsoleState,
+        poll_interval: float = 0.1,
+    ) -> str:
+        print("[Console] Awaiting command...")
+        command_future = loop.run_in_executor(None, self._input, "Command: ")
+        last_state = initial_state
+        while True:
+            done, _ = await asyncio.wait({command_future}, timeout=poll_interval)
+            if command_future in done:
+                return command_future.result()
+            refreshed_state = self.get_state()
+            if refreshed_state != last_state:
+                self._view.render(refreshed_state)
+                self._update_lcd_state()
+                last_state = refreshed_state
 
     async def handle_command(self, command: str) -> bool:
         cmd = (command or "").strip().lower()
@@ -267,6 +289,9 @@ class ConsoleController:
             self._mic.set_input_device(index)
             self._selected_mic = index
             self._prefs["mic_device"] = index
+            signature = self._registry.input_signature(index)
+            if signature:
+                self._prefs["mic_signature"] = signature
             self._persist_preferences()
             self._message = f"Microphone set to device {index}"
             self._force_refresh = True
@@ -280,6 +305,9 @@ class ConsoleController:
             self._speaker.set_output_device(index)
             self._selected_speaker = index
             self._prefs["speaker_device"] = index
+            signature = self._registry.output_signature(index)
+            if signature:
+                self._prefs["speaker_signature"] = signature
             self._persist_preferences()
             self._message = f"Speaker set to device {index}"
             self._force_refresh = True
@@ -312,11 +340,16 @@ class ConsoleController:
 
     def _initialise_device(self, pref_key: str, is_input: bool) -> Optional[int]:
         pref_value = self._prefs.get(pref_key)
+        signature_key = "mic_signature" if is_input else "speaker_signature"
+        signature_value = self._prefs.get(signature_key)
         if is_input:
             is_valid = (
                 self._registry.is_valid_input(pref_value)
                 if pref_value is not None
                 else False
+            )
+            resolved_from_signature = self._registry.resolve_input_signature(
+                signature_value
             )
             default_index = self._registry.default_input_index()
             apply_fn = self._mic.set_input_device
@@ -327,15 +360,26 @@ class ConsoleController:
                 if pref_value is not None
                 else False
             )
+            resolved_from_signature = self._registry.resolve_output_signature(
+                signature_value
+            )
             default_index = self._registry.default_output_index()
             apply_fn = self._speaker.set_output_device
             label = "speaker"
-        target_index = pref_value if is_valid else default_index
+        target_index = pref_value if is_valid else resolved_from_signature
+        if target_index is None:
+            target_index = default_index
         if target_index is None:
             self._message = f"No {label} devices detected."
             return None
         if pref_value is None or not is_valid:
             self._prefs[pref_key] = target_index
+            if is_input:
+                resolved_signature = self._registry.input_signature(target_index)
+            else:
+                resolved_signature = self._registry.output_signature(target_index)
+            if resolved_signature:
+                self._prefs[signature_key] = resolved_signature
             self._persist_preferences()
         try:
             apply_fn(target_index)

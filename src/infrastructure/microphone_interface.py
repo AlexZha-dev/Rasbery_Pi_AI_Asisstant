@@ -9,6 +9,18 @@ import sounddevice as sd
 from exceptions.audio_exceptions import AudioError
 
 
+def _resolve_default_device_index(defaults, position: int):
+    if defaults is None:
+        return None
+    candidate = defaults
+    try:
+        if not isinstance(defaults, (str, bytes)) and len(defaults) > position:
+            candidate = defaults[position]
+    except TypeError:
+        candidate = defaults
+    return candidate
+
+
 class MicrophoneInterface:
     """Неблокирующий интерфейс для записи фиксированных блоков сэмплов.
 
@@ -39,10 +51,7 @@ class MicrophoneInterface:
 
         # Сохранение исходных системных устройств
         defaults = sd.default.device  # (input, output) или одно значение
-        if isinstance(defaults, tuple) and len(defaults) >= 1:
-            self._initial_input_device = defaults[0]
-        else:
-            self._initial_input_device = defaults
+        self._initial_input_device = _resolve_default_device_index(defaults, 0)
 
         self._device = self._initial_input_device
 

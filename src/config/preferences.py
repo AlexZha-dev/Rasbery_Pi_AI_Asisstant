@@ -2,12 +2,12 @@ from __future__ import annotations
 
 import json
 from pathlib import Path
-from typing import Dict, Optional
+from typing import Any, Dict, Optional
 
 DEFAULT_PREF_PATH = Path(__file__).resolve().parent / "user_prefs.json"
 
 
-def load_preferences(path: Optional[Path] = None) -> Dict[str, int]:
+def load_preferences(path: Optional[Path] = None) -> Dict[str, Any]:
     target = Path(path or DEFAULT_PREF_PATH)
     if not target.exists():
         return {}
@@ -18,7 +18,7 @@ def load_preferences(path: Optional[Path] = None) -> Dict[str, int]:
         return {}
 
 
-def save_preferences(prefs: Dict[str, int], path: Optional[Path] = None) -> None:
+def save_preferences(prefs: Dict[str, Any], path: Optional[Path] = None) -> None:
     target = Path(path or DEFAULT_PREF_PATH)
     target.parent.mkdir(parents=True, exist_ok=True)
     data = json.dumps(prefs, indent=2, sort_keys=True)

@@ -1,12 +1,12 @@
 # Установки по умолчанию
-PYTHON = python3
-PIP = pip
+PYTHON ?= python
+PIP = $(PYTHON) -m pip
 REQ_FILE = requirements.txt
 REQ_DEV_FILE = requirements-dev.txt
 
 # -------------------------------
 # Установка зависимостей
-install:
+install: check-python
 	$(PIP) install --upgrade pip
 	$(PIP) install -r $(REQ_FILE)
 	$(PIP) install -r $(REQ_DEV_FILE)

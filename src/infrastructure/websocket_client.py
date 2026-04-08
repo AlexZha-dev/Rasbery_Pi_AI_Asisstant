@@ -6,11 +6,12 @@ import time
 from contextlib import suppress
 from datetime import datetime, timezone
 from typing import Callable, Dict, Optional
-from urllib.parse import urlsplit
+from urllib.parse import parse_qsl, urlencode, urlsplit, urlunsplit
 
 import numpy as np
 import websockets
 from websockets import WebSocketClientProtocol
+from websockets.exceptions import InvalidStatus
 
 from config.audio_config import AUDIO_WS_URL
 from dto.audio_message import AudioMessage, np_to_base64
@@ -33,6 +34,12 @@ _SENSITIVE_HEADER_MARKERS = (
     "x-api-key",
     "proxy-authorization",
 )
+
+_BINARY_AUDIO_PATH = "/ws/audio"
+_DEFAULT_STREAM_SAMPLE_RATE = 16000
+_DEFAULT_STREAM_CHUNK_FRAMES = 1024
+_DEFAULT_STREAM_CHANNELS = 1
+_DEFAULT_STREAM_SAMPWIDTH = 2
 
 
 def _utc_timestamp() -> str:
@@ -127,6 +134,7 @@ class AudioWebSocketClient:
         self._connected = asyncio.Event()
         self._ready_event = asyncio.Event()
         self._closing = False
+        self._explicit_mode = mode is not None
         self._mode = mode or self._infer_mode_from_url(self.url)
         self._max_frame_bytes = max(1024, int(max_frame_bytes))
         self._connect_timeout = max(0.1, float(connect_timeout))
@@ -138,6 +146,10 @@ class AudioWebSocketClient:
         self._retry_backoff_max = max(self._retry_backoff_base, float(retry_backoff_max))
         self._ready_timeout = max(0.1, float(ready_timeout))
         self._log_payload_snippets = bool(log_payload_snippets)
+        self._stream_sample_rate = _DEFAULT_STREAM_SAMPLE_RATE
+        self._stream_chunk_frames = _DEFAULT_STREAM_CHUNK_FRAMES
+        self._stream_channels = _DEFAULT_STREAM_CHANNELS
+        self._stream_sampwidth = _DEFAULT_STREAM_SAMPWIDTH
         # Binary protocol state
         self._binary_started: bool = False
         self._binary_chunks_sent: int = 0
@@ -321,14 +333,138 @@ class AudioWebSocketClient:
 
     @staticmethod
     def _infer_mode_from_url(url: str) -> str:
-        try:
-            path = urlsplit(url).path or ""
-        except Exception:
-            path = ""
-        # Heuristic: main service uses '/ws/audio'
-        if path.endswith("/ws/audio"):
+        if AudioWebSocketClient._is_binary_endpoint_url(url):
             return "binary"
         return "json"
+
+    @staticmethod
+    def _normalized_path(path: str) -> str:
+        normalized = (path or "").strip()
+        if not normalized or normalized == "/":
+            return "/"
+        return normalized.rstrip("/") or "/"
+
+    @classmethod
+    def _is_binary_endpoint_url(cls, url: str) -> bool:
+        try:
+            path = cls._normalized_path(urlsplit(url).path)
+        except Exception:
+            return False
+        return path == _BINARY_AUDIO_PATH
+
+    @classmethod
+    def _is_root_endpoint_url(cls, url: str) -> bool:
+        try:
+            path = cls._normalized_path(urlsplit(url).path)
+        except Exception:
+            return False
+        return path == "/"
+
+    @staticmethod
+    def _merge_query_params(url: str, params: Dict[str, int]) -> str:
+        parsed = urlsplit(url)
+        existing = dict(parse_qsl(parsed.query, keep_blank_values=True))
+        for key, value in params.items():
+            existing.setdefault(key, str(value))
+        return urlunsplit(
+            (
+                parsed.scheme,
+                parsed.netloc,
+                parsed.path or "/",
+                urlencode(existing),
+                parsed.fragment,
+            )
+        )
+
+    @staticmethod
+    def _replace_path(url: str, path: str) -> str:
+        parsed = urlsplit(url)
+        return urlunsplit(
+            (
+                parsed.scheme,
+                parsed.netloc,
+                path,
+                parsed.query,
+                parsed.fragment,
+            )
+        )
+
+    @staticmethod
+    def _status_code_from_exception(exc: Exception) -> Optional[int]:
+        response = getattr(exc, "response", None)
+        status_code = getattr(response, "status_code", None)
+        if status_code is None:
+            return None
+        try:
+            return int(status_code)
+        except (TypeError, ValueError):
+            return None
+
+    def configure_stream(
+        self,
+        *,
+        sample_rate: int,
+        chunk_frames: int,
+        channels: int,
+        sampwidth: int = 2,
+    ) -> None:
+        self._stream_sample_rate = max(1, int(sample_rate or _DEFAULT_STREAM_SAMPLE_RATE))
+        self._stream_chunk_frames = max(
+            1, int(chunk_frames or _DEFAULT_STREAM_CHUNK_FRAMES)
+        )
+        self._stream_channels = max(1, int(channels or _DEFAULT_STREAM_CHANNELS))
+        self._stream_sampwidth = max(1, int(sampwidth or _DEFAULT_STREAM_SAMPWIDTH))
+
+    def _binary_handshake_query_params(self) -> Dict[str, int]:
+        return {
+            "sample_rate": int(self._stream_sample_rate),
+            "chunk_size": int(self._stream_chunk_frames),
+            "channels": int(self._stream_channels),
+            "bit_depth_bytes": int(self._stream_sampwidth),
+        }
+
+    def _build_connect_url(self, url: str, mode: str) -> str:
+        connect_url = url
+        if mode == "binary":
+            if self._is_root_endpoint_url(connect_url):
+                connect_url = self._replace_path(connect_url, _BINARY_AUDIO_PATH)
+            connect_url = self._merge_query_params(
+                connect_url, self._binary_handshake_query_params()
+            )
+        return connect_url
+
+    def _build_connect_candidates(self):
+        primary_url = self._build_connect_url(self.url, self._mode)
+        candidates = [
+            {
+                "url": primary_url,
+                "mode": self._mode,
+                "is_fallback": False,
+            }
+        ]
+        if (
+            not self._explicit_mode
+            and self._mode != "binary"
+            and self._is_root_endpoint_url(self.url)
+        ):
+            fallback_url = self._build_connect_url(self.url, "binary")
+            if fallback_url != primary_url:
+                candidates.append(
+                    {
+                        "url": fallback_url,
+                        "mode": "binary",
+                        "is_fallback": True,
+                    }
+                )
+        return candidates
+
+    def _format_connect_error(self, url: str, exc: Exception) -> str:
+        message = str(exc)
+        status_code = self._status_code_from_exception(exc)
+        if status_code == 403 and self._is_root_endpoint_url(url):
+            expected = _safe_url_for_logs(self._build_connect_url(url, "binary"))
+            return f"{message}; server likely expects {expected}"
+        return message
 
     async def connect(self):
         self._closing = False
@@ -355,79 +491,115 @@ class AudioWebSocketClient:
         self._closed_at = None
         self._ready_event.clear()
         self._connected.clear()
-        safe_url = _safe_url_for_logs(self.url)
         attempt = 0
         while True:
             attempt += 1
-            try:
-                self._ws = await websockets.connect(
-                    self.url,
-                    max_size=self._max_frame_bytes,
-                    open_timeout=self._connect_timeout,
-                )
-                AudioWebSocketClient._SESSION_INDEX += 1
-                self._session_name = f"ws-{AudioWebSocketClient._SESSION_INDEX}"
-                AudioWebSocketClient._ACTIVE_SESSIONS += 1
-                self._connected_at = time.monotonic()
-                self._handshake_request_headers = _sanitize_headers(
-                    _headers_to_dict(getattr(self._ws, "request_headers", None))
-                )
-                self._handshake_response_headers = _sanitize_headers(
-                    _headers_to_dict(getattr(self._ws, "response_headers", None))
-                )
-                self._handshake_subprotocol = getattr(self._ws, "subprotocol", None)
-                handshake_extra = {
-                    "request_headers": self._handshake_request_headers,
-                    "response_headers": self._handshake_response_headers,
-                }
-                if self._log_payload_snippets:
-                    handshake_note = _truncate_text(json.dumps(handshake_extra))
-                else:
-                    handshake_note = (
-                        f"request_headers={len(self._handshake_request_headers)} "
-                        f"response_headers={len(self._handshake_response_headers)}"
+            candidates = self._build_connect_candidates()
+            last_exc: Optional[Exception] = None
+            for index, candidate in enumerate(candidates, start=1):
+                connect_url = str(candidate["url"])
+                candidate_mode = str(candidate["mode"])
+                safe_url = _safe_url_for_logs(connect_url)
+                try:
+                    self._ws = await websockets.connect(
+                        connect_url,
+                        max_size=self._max_frame_bytes,
+                        open_timeout=self._connect_timeout,
                     )
-                self._log(
-                    "WS_OPEN",
-                    " ".join(
-                        [
-                            f"url={safe_url}",
-                            f"subprotocol={self._handshake_subprotocol or '-'}",
-                            f"active={AudioWebSocketClient._ACTIVE_SESSIONS}",
-                            f"max_frame_bytes={self._max_frame_bytes}",
-                            f"handshake={handshake_note}",
-                        ]
-                    ),
-                )
-                self._connected.set()
-                self._recv_task = asyncio.create_task(self._receiver_loop())
-                return
-            except Exception as exc:
-                if self._max_retries is not None and attempt >= self._max_retries:
+                    self._mode = candidate_mode
+                    AudioWebSocketClient._SESSION_INDEX += 1
+                    self._session_name = f"ws-{AudioWebSocketClient._SESSION_INDEX}"
+                    AudioWebSocketClient._ACTIVE_SESSIONS += 1
+                    self._connected_at = time.monotonic()
+                    self._handshake_request_headers = _sanitize_headers(
+                        _headers_to_dict(getattr(self._ws, "request_headers", None))
+                    )
+                    self._handshake_response_headers = _sanitize_headers(
+                        _headers_to_dict(getattr(self._ws, "response_headers", None))
+                    )
+                    self._handshake_subprotocol = getattr(self._ws, "subprotocol", None)
+                    handshake_extra = {
+                        "request_headers": self._handshake_request_headers,
+                        "response_headers": self._handshake_response_headers,
+                    }
+                    if self._log_payload_snippets:
+                        handshake_note = _truncate_text(json.dumps(handshake_extra))
+                    else:
+                        handshake_note = (
+                            f"request_headers={len(self._handshake_request_headers)} "
+                            f"response_headers={len(self._handshake_response_headers)}"
+                        )
+                    self._log(
+                        "WS_OPEN",
+                        " ".join(
+                            [
+                                f"url={safe_url}",
+                                f"mode={self._mode}",
+                                f"subprotocol={self._handshake_subprotocol or '-'}",
+                                f"active={AudioWebSocketClient._ACTIVE_SESSIONS}",
+                                f"max_frame_bytes={self._max_frame_bytes}",
+                                f"handshake={handshake_note}",
+                            ]
+                        ),
+                    )
+                    self._connected.set()
+                    self._recv_task = asyncio.create_task(self._receiver_loop())
+                    return
+                except Exception as exc:
+                    last_exc = exc
+                    should_try_fallback = (
+                        index < len(candidates)
+                        and not bool(candidate["is_fallback"])
+                        and isinstance(exc, InvalidStatus)
+                        and self._status_code_from_exception(exc) in {400, 401, 403, 404}
+                    )
+                    error_message = self._format_connect_error(connect_url, exc)
+                    if should_try_fallback:
+                        self._log(
+                            "WS_ERROR",
+                            (
+                                f"connection_failed attempt={attempt} "
+                                f"candidate={index}/{len(candidates)} "
+                                f"url={safe_url} mode={candidate_mode} "
+                                f"retrying_with_fallback=True error={error_message}"
+                            ),
+                            level=logging.WARNING,
+                            exc_info=True,
+                        )
+                        continue
+                    if self._max_retries is not None and attempt >= self._max_retries:
+                        self._log(
+                            "WS_ERROR",
+                            (
+                                f"connection_failed attempts={attempt} "
+                                f"url={safe_url} mode={candidate_mode} "
+                                f"giving_up=True error={error_message}"
+                            ),
+                            level=logging.ERROR,
+                            exc_info=True,
+                        )
+                        raise ConnectionError(
+                            f"Unable to connect to websocket after {attempt} attempts: "
+                            f"{error_message}"
+                        ) from exc
                     self._log(
                         "WS_ERROR",
                         (
-                            f"connection_failed attempts={attempt} "
-                            f"url={safe_url} giving_up=True error={exc}"
+                            f"connection_failed attempt={attempt} "
+                            f"url={safe_url} mode={candidate_mode} error={error_message}"
                         ),
-                        level=logging.ERROR,
+                        level=logging.WARNING,
                         exc_info=True,
                     )
-                    raise ConnectionError(
-                        f"Unable to connect to websocket after {attempt} attempts"
-                    ) from exc
-                self._log(
-                    "WS_ERROR",
-                    f"connection_failed attempt={attempt} url={safe_url} error={exc}",
-                    level=logging.WARNING,
-                    exc_info=True,
-                )
-                delay = min(
-                    self._retry_backoff_max,
-                    self._retry_backoff_base * (2 ** max(0, attempt - 1)),
-                )
-                jitter = random.uniform(0.0, min(0.2, delay * 0.2))
-                await asyncio.sleep(delay + jitter)
+                    break
+            if last_exc is None:
+                raise ConnectionError("Unable to connect to websocket")
+            delay = min(
+                self._retry_backoff_max,
+                self._retry_backoff_base * (2 ** max(0, attempt - 1)),
+            )
+            jitter = random.uniform(0.0, min(0.2, delay * 0.2))
+            await asyncio.sleep(delay + jitter)
 
     async def close(
         self, reason: str = "client_shutdown", trigger: Optional[str] = None
@@ -522,9 +694,11 @@ class AudioWebSocketClient:
             "type": "start",
             "session_id": session_id,
             "sample_rate": int(sample_rate),
-            "chunk_size": int(chunk_bytes),
+            "chunk_size": int(chunk_frames),
+            "chunk_size_bytes": int(chunk_bytes),
             "channels": channels,
             "sampwidth": sampwidth,
+            "bit_depth_bytes": sampwidth,
         }
         payload = json.dumps(start_msg)
         self._record_session_id(session_id)
@@ -715,6 +889,11 @@ class AudioWebSocketClient:
                         extra = f"extra={_truncate_text(json.dumps(msg.extra))}"
                     except (TypeError, ValueError):
                         extra = "extra=<unserializable>"
+
+                if self._is_heartbeat_message(msg):
+                    self._last_event_type = "heartbeat"
+                    continue
+
                 self._log_frame(
                     "<",
                     "text",
@@ -827,6 +1006,14 @@ class AudioWebSocketClient:
             return
         self._last_event_type = "ack"
         self._log("WS_MESSAGE", f"< ack count={count}")
+
+    @staticmethod
+    def _is_heartbeat_message(msg: AudioMessage) -> bool:
+        if (msg.type or "").strip().lower() == "heartbeat":
+            return True
+        extra = msg.extra or {}
+        event = str(extra.get("event") or "").strip().lower()
+        return event == "heartbeat"
 
     def _encode_pcm(self, frame: np.ndarray) -> bytes:
         arr = np.asarray(frame, dtype=np.float32)
