@@ -892,6 +892,16 @@ class AudioWebSocketClient:
 
                 if self._is_heartbeat_message(msg):
                     self._last_event_type = "heartbeat"
+                    if self._on_receive:
+                        try:
+                            await self._on_receive(msg)
+                        except Exception as exc:
+                            self._log(
+                                "WS_ERROR",
+                                f"message_handler_error error={exc}",
+                                level=logging.ERROR,
+                                exc_info=True,
+                            )
                     continue
 
                 self._log_frame(

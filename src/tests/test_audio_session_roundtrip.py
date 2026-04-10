@@ -1,6 +1,8 @@
 import asyncio
 import threading
+import time
 import uuid
+import json
 from pathlib import Path
 from typing import Awaitable
 
@@ -64,6 +66,46 @@ class DummySpeakerInterface:
             raise RuntimeError("Speaker not started")
         with self._lock:
             self.frames.append(np.asarray(samples))
+
+    def pending_frames(self):
+        return 0
+
+
+class ImmediateMicrophoneInterface:
+    def __init__(self):
+        self._is_recording = False
+        self.samplerate = 16000
+        self.blocksize = 1024
+        self.channels = 1
+
+    def start_recording(self):
+        self._is_recording = True
+
+    def stop_recording(self):
+        self._is_recording = False
+
+    @property
+    def is_recording(self):
+        return self._is_recording
+
+
+class ImmediateMicrophoneAdapter:
+    def __init__(self, mic):
+        self.mic = mic
+
+    async def get_samples(self):
+        return None
+
+
+class ImmediateSpeakerAdapter:
+    def __init__(self, spk):
+        self.spk = spk
+
+    async def play(self, samples):
+        self.spk.play(samples)
+
+    async def flush(self, timeout: float = 1.5) -> bool:
+        return True
 
 
 async def unlink_with_retry(path: Path, attempts: int = 10, delay: float = 0.05) -> bool:
@@ -165,3 +207,70 @@ async def test_audio_session_roundtrip(audio_test_server, mode):
         expected_chunk_bytes = blocksize * params["channels"] * params["sampwidth"]
         assert params["chunk_size"] == blocksize
         assert params["chunk_size_bytes"] == expected_chunk_bytes
+
+
+@pytest.mark.asyncio
+async def test_audio_session_waits_through_heartbeat_only_playback_gap():
+    async def handle_heartbeat_only_client(ws):
+        session_id = None
+        await ws.send("ready")
+        async for message in ws:
+            if not isinstance(message, str):
+                continue
+            payload = json.loads(message)
+            msg_type = payload.get("type")
+            session_id = payload.get("session_id") or session_id
+            if msg_type != "playback":
+                continue
+
+            # Keep the connection alive longer than playback_timeout without
+            # starting playback yet, then finish cleanly.
+            for _ in range(12):
+                await asyncio.sleep(0.1)
+                await ws.send(
+                    json.dumps(
+                        {
+                            "type": "heartbeat",
+                            "event": "heartbeat",
+                            "session_id": session_id,
+                        }
+                    )
+                )
+            await ws.send(
+                json.dumps({"type": "playback.end", "session_id": session_id})
+            )
+
+    try:
+        server = await websockets.serve(
+            handle_heartbeat_only_client, "127.0.0.1", 0, max_size=None
+        )
+    except OSError as exc:  # pragma: no cover - sandboxed CI without socket perms
+        pytest.skip(f"Unable to start local websocket test server: {exc}")
+
+    port = server.sockets[0].getsockname()[1]
+    url = f"ws://127.0.0.1:{port}"
+
+    mic = ImmediateMicrophoneInterface()
+    spk = DummySpeakerInterface()
+    mic_adapter = ImmediateMicrophoneAdapter(mic)
+    spk_adapter = ImmediateSpeakerAdapter(spk)
+    ws_client = AudioWebSocketClient(url=url)
+    session = AudioSession(ws_client, mic_adapter, spk_adapter)
+
+    started_at = time.monotonic()
+    try:
+        await run_with_timeout(
+            session.run_once(timeout=0.05, playback_timeout=0.3),
+            5.0,
+            "heartbeat-only playback wait",
+        )
+    finally:
+        await run_with_timeout(
+            ws_client.close(reason="test_teardown", trigger="pytest.teardown"),
+            2.0,
+            "websocket close",
+        )
+        server.close()
+        await server.wait_closed()
+
+    assert time.monotonic() - started_at >= 1.5

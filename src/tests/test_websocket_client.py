@@ -22,6 +22,19 @@ class DummyWebSocket:
         return None
 
 
+class IterableWebSocket(DummyWebSocket):
+    def __init__(self, messages):
+        self._messages = list(messages)
+
+    def __aiter__(self):
+        return self
+
+    async def __anext__(self):
+        if not self._messages:
+            raise StopAsyncIteration
+        return self._messages.pop(0)
+
+
 def make_invalid_status(status_code: int) -> InvalidStatus:
     return InvalidStatus(
         Response(status_code=status_code, reason_phrase="Forbidden", headers=Headers())
@@ -137,3 +150,22 @@ def test_heartbeat_message_detection_accepts_type_and_event_formats():
     assert not AudioWebSocketClient._is_heartbeat_message(
         AudioMessage(type="response.end", session_id=None)
     )
+
+
+@pytest.mark.asyncio
+async def test_receiver_loop_forwards_heartbeat_to_message_handler():
+    received = []
+
+    async def on_receive(msg):
+        received.append(msg)
+
+    client = AudioWebSocketClient(url="ws://127.0.0.1:8765", on_receive=on_receive)
+    client._ws = IterableWebSocket(
+        ['{"type":"heartbeat","event":"heartbeat","session_id":"test-session"}']
+    )
+
+    await client._receiver_loop()
+
+    assert len(received) == 1
+    assert received[0].type == "heartbeat"
+    assert received[0].session_id == "test-session"
