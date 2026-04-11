@@ -56,6 +56,18 @@ Set `AUDIO_WS_URL` via environment variable or a `.env` file in the project root
 AUDIO_WS_URL=wss://your-server.example/ws/audio
 ```
 
+If the server is exposed through `cloudflared` and protected by a shared
+password, also set:
+
+```env
+AUDIO_WS_URL=wss://<random>.trycloudflare.com/ws/audio
+AUDIO_WS_PASSWORD=replace-with-shared-password
+```
+
+When `AUDIO_WS_PASSWORD` is set, the client automatically adds
+`?access_password=...` to the WebSocket URL unless that query parameter is
+already present.
+
 Security rules:
 - The app fails fast if `AUDIO_WS_URL` is missing
 - `ws://` is accepted only for localhost (`127.0.0.1`, `localhost`, `::1`)
@@ -116,6 +128,8 @@ Entry points:
   - Set it in your shell or create a `.env` file in the project root
 - Cannot connect to remote `ws://` endpoint
   - Use `wss://` for non-localhost hosts
+- Cloudflared / shared-password deployment returns `401` or `403`
+  - Set `AUDIO_WS_PASSWORD` or append `?access_password=...` to `AUDIO_WS_URL`
 - PortAudio or ALSA errors
   - Verify system packages are installed and pick valid input/output device indices
 - `pydantic-core` fails with a Rust or Cargo error during install
