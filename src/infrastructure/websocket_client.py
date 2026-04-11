@@ -5,7 +5,7 @@ import random
 import time
 from contextlib import suppress
 from datetime import datetime, timezone
-from typing import Callable, Dict, Optional
+from typing import Callable, Dict, Mapping, Optional
 from urllib.parse import parse_qsl, urlencode, urlsplit, urlunsplit
 
 import numpy as np
@@ -13,7 +13,7 @@ import websockets
 from websockets import WebSocketClientProtocol
 from websockets.exceptions import InvalidStatus
 
-from config.audio_config import AUDIO_WS_URL
+from config.audio_config import AUDIO_WS_PASSWORD, AUDIO_WS_URL
 from dto.audio_message import AudioMessage, np_to_base64
 
 logger = logging.getLogger(__name__)
@@ -116,6 +116,7 @@ class AudioWebSocketClient:
     def __init__(
         self,
         url: Optional[str] = None,
+        password: Optional[str] = None,
         on_receive: Optional[Callable[[AudioMessage], None]] = None,
         mode: Optional[str] = None,  # 'json' or 'binary' (auto if None)
         max_frame_bytes: int = 4 * 1024 * 1024,
@@ -127,6 +128,10 @@ class AudioWebSocketClient:
         log_payload_snippets: bool = False,
     ):
         self.url = url or AUDIO_WS_URL
+        normalized_password = (
+            password if password is not None else AUDIO_WS_PASSWORD
+        )
+        self._password = (normalized_password or "").strip() or None
         self._ws: Optional[WebSocketClientProtocol] = None
         self._on_receive = on_receive
         self._on_receive_binary: Optional[Callable[[bytes], None]] = None
@@ -361,7 +366,9 @@ class AudioWebSocketClient:
         return path == "/"
 
     @staticmethod
-    def _merge_query_params(url: str, params: Dict[str, int]) -> str:
+    def _merge_query_params(url: str, params: Mapping[str, object]) -> str:
+        if not params:
+            return url
         parsed = urlsplit(url)
         existing = dict(parse_qsl(parsed.query, keep_blank_values=True))
         for key, value in params.items():
@@ -370,7 +377,7 @@ class AudioWebSocketClient:
             (
                 parsed.scheme,
                 parsed.netloc,
-                parsed.path or "/",
+                parsed.path,
                 urlencode(existing),
                 parsed.fragment,
             )
@@ -423,8 +430,16 @@ class AudioWebSocketClient:
             "bit_depth_bytes": int(self._stream_sampwidth),
         }
 
+    def _shared_access_query_params(self) -> Dict[str, str]:
+        if not self._password:
+            return {}
+        return {"access_password": self._password}
+
     def _build_connect_url(self, url: str, mode: str) -> str:
         connect_url = url
+        connect_url = self._merge_query_params(
+            connect_url, self._shared_access_query_params()
+        )
         if mode == "binary":
             if self._is_root_endpoint_url(connect_url):
                 connect_url = self._replace_path(connect_url, _BINARY_AUDIO_PATH)

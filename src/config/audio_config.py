@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 from functools import lru_cache
+from typing import Any
 from urllib.parse import urlsplit
 
 from pydantic import ValidationError, field_validator
@@ -14,6 +15,7 @@ def _is_localhost(hostname: str) -> bool:
 
 class AudioSettings(BaseSettings):
     audio_ws_url: str
+    audio_ws_password: str | None = None
 
     model_config = SettingsConfigDict(
         env_file=".env",
@@ -44,6 +46,14 @@ class AudioSettings(BaseSettings):
             )
         return url
 
+    @field_validator("audio_ws_password", mode="before")
+    @classmethod
+    def normalize_audio_ws_password(cls, value: Any) -> str | None:
+        if value is None:
+            return None
+        normalized = str(value).strip()
+        return normalized or None
+
 
 @lru_cache(maxsize=1)
 def get_settings() -> AudioSettings:
@@ -61,3 +71,4 @@ def get_settings() -> AudioSettings:
 
 settings = get_settings()
 AUDIO_WS_URL = settings.audio_ws_url
+AUDIO_WS_PASSWORD = settings.audio_ws_password

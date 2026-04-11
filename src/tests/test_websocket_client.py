@@ -44,7 +44,10 @@ def make_invalid_status(status_code: int) -> InvalidStatus:
 @pytest.mark.asyncio
 async def test_wait_for_ready_raises_timeout():
     client = AudioWebSocketClient(
-        url="ws://127.0.0.1:8765", ready_timeout=0.01, max_retries=1
+        url="ws://127.0.0.1:8765",
+        password="",
+        ready_timeout=0.01,
+        max_retries=1,
     )
     with pytest.raises(TimeoutError):
         await client._wait_for_ready()
@@ -58,6 +61,7 @@ async def test_connect_respects_retry_limit(monkeypatch):
     monkeypatch.setattr(ws_module.websockets, "connect", always_fail)
     client = AudioWebSocketClient(
         url="ws://127.0.0.1:8765",
+        password="",
         max_retries=2,
         retry_backoff_base=0.001,
         retry_backoff_max=0.001,
@@ -79,6 +83,7 @@ async def test_connect_retries_root_url_as_binary_endpoint_on_403(monkeypatch):
     monkeypatch.setattr(ws_module.websockets, "connect", fake_connect)
     client = AudioWebSocketClient(
         url="ws://127.0.0.1:8000",
+        password="",
         max_retries=1,
     )
     client.configure_stream(
@@ -116,6 +121,7 @@ async def test_connect_adds_handshake_query_params_for_binary_endpoint(monkeypat
     monkeypatch.setattr(ws_module.websockets, "connect", fake_connect)
     client = AudioWebSocketClient(
         url="ws://127.0.0.1:8000/ws/audio",
+        password="",
         max_retries=1,
     )
     client.configure_stream(
@@ -140,6 +146,59 @@ async def test_connect_adds_handshake_query_params_for_binary_endpoint(monkeypat
     await client.close(reason="test_close", trigger="pytest")
 
 
+@pytest.mark.asyncio
+async def test_connect_adds_shared_access_password_query_param(monkeypatch):
+    calls = []
+
+    async def fake_connect(url, **kwargs):
+        calls.append(url)
+        return DummyWebSocket()
+
+    monkeypatch.setattr(ws_module.websockets, "connect", fake_connect)
+    client = AudioWebSocketClient(
+        url="wss://demo.trycloudflare.com",
+        password="shared-secret",
+        mode="json",
+        max_retries=1,
+    )
+    client._receiver_loop = lambda: ws_module.asyncio.sleep(0)
+
+    await client.connect()
+
+    parsed = urlsplit(calls[0])
+    assert parsed.path == ""
+    assert parse_qs(parsed.query) == {
+        "access_password": ["shared-secret"],
+    }
+
+    await client.close(reason="test_close", trigger="pytest")
+
+
+@pytest.mark.asyncio
+async def test_connect_keeps_explicit_access_password_from_url(monkeypatch):
+    calls = []
+
+    async def fake_connect(url, **kwargs):
+        calls.append(url)
+        return DummyWebSocket()
+
+    monkeypatch.setattr(ws_module.websockets, "connect", fake_connect)
+    client = AudioWebSocketClient(
+        url="wss://demo.trycloudflare.com/ws/audio?access_password=url-secret",
+        password="env-secret",
+        max_retries=1,
+    )
+    client._receiver_loop = lambda: ws_module.asyncio.sleep(0)
+
+    await client.connect()
+
+    parsed = urlsplit(calls[0])
+    assert parsed.path == "/ws/audio"
+    assert parse_qs(parsed.query)["access_password"] == ["url-secret"]
+
+    await client.close(reason="test_close", trigger="pytest")
+
+
 def test_heartbeat_message_detection_accepts_type_and_event_formats():
     assert AudioWebSocketClient._is_heartbeat_message(
         AudioMessage(type="heartbeat", session_id=None)
@@ -159,7 +218,11 @@ async def test_receiver_loop_forwards_heartbeat_to_message_handler():
     async def on_receive(msg):
         received.append(msg)
 
-    client = AudioWebSocketClient(url="ws://127.0.0.1:8765", on_receive=on_receive)
+    client = AudioWebSocketClient(
+        url="ws://127.0.0.1:8765",
+        password="",
+        on_receive=on_receive,
+    )
     client._ws = IterableWebSocket(
         ['{"type":"heartbeat","event":"heartbeat","session_id":"test-session"}']
     )
