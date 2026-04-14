@@ -2,6 +2,8 @@ import asyncio
 import json
 import queue
 import shutil
+import threading
+import time
 import uuid
 from pathlib import Path
 
@@ -138,6 +140,37 @@ class FakeServiceButton:
     def close(self):
         self.closed = True
         self.is_enabled = False
+
+
+class HoldServiceButton:
+    def __init__(self):
+        self.is_enabled = True
+        self.closed = False
+        self._pressed = threading.Event()
+
+    def press(self):
+        self._pressed.set()
+
+    def release(self):
+        self._pressed.clear()
+
+    def wait_for_press(self, timeout=None):
+        return self._pressed.wait(timeout)
+
+    def wait_for_release(self, timeout=None):
+        if not self._pressed.is_set():
+            return True
+        deadline = None if timeout is None else time.monotonic() + timeout
+        while self._pressed.is_set():
+            if deadline is not None and time.monotonic() >= deadline:
+                return False
+            time.sleep(0.01)
+        return True
+
+    def close(self):
+        self.closed = True
+        self.is_enabled = False
+        self._pressed.clear()
 
 
 class StubRegistry(DeviceRegistry):
@@ -405,6 +438,58 @@ async def test_service_mode_uses_button_without_console_input(workspace_tmp_path
         assert runner.stop_calls == 1
         assert any(state.session_state == "recording" for state in view.states)
     finally:
+        stop_event.set()
+        await asyncio.wait_for(task, timeout=2.0)
+
+    assert button.closed is True
+
+
+@pytest.mark.asyncio
+async def test_service_mode_waits_for_button_release_before_next_toggle(
+    workspace_tmp_path,
+):
+    controller, mic, spk, runner, fake_input, registry = build_controller(
+        workspace_tmp_path, FailingInput()
+    )
+    button = HoldServiceButton()
+    view = RecordingView()
+    controller = ConsoleController(
+        microphone=mic,
+        speaker=spk,
+        registry=registry,
+        session_runner=runner,
+        view=view,
+        button=button,
+        input_provider=FailingInput(),
+        preferences_path=workspace_tmp_path / "prefs.json",
+    )
+    stop_event = asyncio.Event()
+
+    task = asyncio.create_task(
+        controller.run_service(stop_event=stop_event, poll_interval=0.01)
+    )
+    try:
+        await asyncio.sleep(0.05)
+
+        button.press()
+        await asyncio.sleep(0.4)
+
+        assert runner.start_calls == 1
+        assert runner.stop_calls == 0
+        assert runner.running is True
+
+        button.release()
+        await asyncio.sleep(0.15)
+
+        button.press()
+        for _ in range(20):
+            if runner.stop_calls == 1:
+                break
+            await asyncio.sleep(0.05)
+
+        assert runner.stop_calls == 1
+    finally:
+        button.release()
         stop_event.set()
         await asyncio.wait_for(task, timeout=2.0)
 

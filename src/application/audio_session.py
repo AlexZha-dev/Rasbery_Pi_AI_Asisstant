@@ -166,6 +166,12 @@ class AudioSession:
                 reset_speaker()
             except Exception:
                 pass
+        stop_output = getattr(self.spk.spk, "stop_output", None)
+        if callable(stop_output):
+            try:
+                stop_output()
+            except Exception:
+                pass
         self.spk.spk.start_output()
         try:
             self.mic.mic.start_recording()

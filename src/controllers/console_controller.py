@@ -278,14 +278,22 @@ class ConsoleController:
 
     async def _handle_close_websocket(self) -> bool:
         success, msg = await self._runner.close_websocket()
+        runner_idle = False
         if success:
-            await self._wait_for_runner_idle()
+            runner_idle = await self._wait_for_runner_idle()
         self._message = msg
         lowered = msg.lower() if msg else ""
-        if success or "not running" in lowered or "already requested" in lowered:
+        if success and runner_idle:
+            self._record_state = "ready"
+        elif success:
+            self._record_state = "await_close"
+        elif "not running" in lowered or "already requested" in lowered:
             self._record_state = "ready"
         if success:
-            self._queue_lcd_state("answer_stopped", hold_for=2.0)
+            if runner_idle:
+                self._queue_lcd_state("answer_stopped", hold_for=2.0)
+            else:
+                self._queue_lcd_state("waiting_for_response", hold_for=1.0)
         else:
             if "not running" in lowered:
                 self._queue_lcd_state("answer_stopped", hold_for=2.0)
@@ -566,7 +574,7 @@ class ConsoleController:
             return
         loop = asyncio.get_running_loop()
         wait_press = functools.partial(button.wait_for_press, 0.1)
-        wait_release = functools.partial(button.wait_for_release, 0.3)
+        wait_release = functools.partial(button.wait_for_release, 0.1)
         try:
             while True:
                 pressed = await loop.run_in_executor(None, wait_press)
@@ -574,7 +582,10 @@ class ConsoleController:
                     continue
                 async with self._button_action_lock:
                     await self._toggle_session()
-                await loop.run_in_executor(None, wait_release)
+                while True:
+                    released = await loop.run_in_executor(None, wait_release)
+                    if released:
+                        break
         except asyncio.CancelledError:  # pragma: no cover - cancellation path
             pass
 
