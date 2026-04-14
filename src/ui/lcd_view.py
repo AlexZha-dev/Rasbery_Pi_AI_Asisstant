@@ -37,14 +37,25 @@ class LCDView:
         lcd: Optional["LCDDisplay"] = None,
         lcd_factory: Optional[Callable[[], "LCDDisplay"]] = None,
         logger: Optional[logging.Logger] = None,
+        reconnect_interval: float = 5.0,
     ) -> None:
         self._logger = logger or logging.getLogger(__name__)
-        self._lcd = self._initialize_display(lcd, lcd_factory)
+        self._lcd_factory = lcd_factory or LCDDisplay
+        self._reconnect_interval = max(0.0, float(reconnect_interval))
+        self._last_init_attempt: float = 0.0
+        self._availability_warned = False
+        self._lcd = lcd
+        if self._lcd is None:
+            self._ensure_display(force=True)
+
+    @property
+    def is_available(self) -> bool:
+        return self._lcd is not None
 
     def show_state(self, state: str) -> None:
         """Update the LCD with a short status message that matches *state*."""
         message, color = self._resolve_template(state)
-        if not self._lcd:
+        if not self._ensure_display():
             return
         try:
             self._lcd.display_text(message, color=color)
@@ -60,28 +71,52 @@ class LCDView:
         except (LCDException, OSError) as exc:
             self._logger.warning("Failed to clear LCD: %s", exc)
 
-    def _initialize_display(
-        self,
-        lcd: Optional["LCDDisplay"],
-        lcd_factory: Optional[Callable[[], "LCDDisplay"]],
-    ) -> Optional["LCDDisplay"]:
-        if lcd is not None:
-            return lcd
+    def close(self) -> None:
+        lcd = self._lcd
+        if lcd is None:
+            return
+        try:
+            close_fn = getattr(lcd, "close", None)
+            if callable(close_fn):
+                close_fn()
+        except Exception as exc:
+            self._logger.warning("Failed to close LCD: %s", exc)
+        finally:
+            self._lcd = None
 
-        if LCDDisplay is None:
+    def _ensure_display(self, *, force: bool = False) -> bool:
+        if self._lcd is not None:
+            return True
+        if self._lcd_factory is None:
             self._warn_no_hardware(_LCD_IMPORT_ERROR)
-            return None
+            return False
 
-        factory = lcd_factory or LCDDisplay
+        now = time.monotonic()
+        if (
+            not force
+            and self._last_init_attempt > 0.0
+            and (now - self._last_init_attempt) < self._reconnect_interval
+        ):
+            return False
+        self._last_init_attempt = now
 
         try:
-            return factory()
+            self._lcd = self._lcd_factory()
         except Exception as exc:  # pragma: no cover
             self._warn_no_hardware(exc)
-            return None
+            return False
+
+        if self._availability_warned:
+            self._logger.info("LCD display became available.")
+            self._availability_warned = False
+        return True
 
     def _warn_no_hardware(self, exc: Optional[Exception]) -> None:
-        self._logger.warning("LCD display not found. Continuing without LCD output.")
+        if not self._availability_warned:
+            self._logger.warning(
+                "LCD display not found. Continuing without LCD output."
+            )
+            self._availability_warned = True
         if exc is not None:
             self._logger.debug("LCD initialization failed: %s", exc, exc_info=exc)
 

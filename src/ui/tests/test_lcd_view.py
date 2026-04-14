@@ -80,3 +80,21 @@ def test_initialization_failure_logs_warning(caplog: pytest.LogCaptureFixture):
 
     # Should not raise when the hardware is unavailable.
     view.show_state("recording")  # no exception expected
+
+
+def test_view_retries_initialization_until_lcd_becomes_available():
+    dummy = DummyLCD()
+    attempts = {"count": 0}
+
+    def flaky_factory():
+        attempts["count"] += 1
+        if attempts["count"] == 1:
+            raise OSError("device not ready")
+        return dummy
+
+    view = LCDView(lcd_factory=flaky_factory, reconnect_interval=0.0)
+
+    view.show_state("recording")
+
+    assert attempts["count"] == 2
+    assert dummy.display_calls == [("Recording...", 0, "success")]

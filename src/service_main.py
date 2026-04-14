@@ -73,13 +73,14 @@ async def main() -> None:
         join_timeout=35.0,
     )
     button = ButtonInterface(pin=17)
+    lcd_view = LCDView(logger=logging.getLogger("ui.lcd_view"))
     controller = ConsoleController(
         microphone=microphone,
         speaker=speaker,
         registry=registry,
         session_runner=runner,
         view=ServiceLogView(logger),
-        lcd_view=LCDView(),
+        lcd_view=lcd_view,
         button=button,
     )
 
@@ -88,8 +89,9 @@ async def main() -> None:
 
     state = controller.get_state()
     logger.info(
-        "Service ready. button_enabled=%s mic=%s speaker=%s",
+        "Service ready. button_enabled=%s lcd_available=%s mic=%s speaker=%s",
         button.is_enabled,
+        lcd_view.is_available,
         state.selected_mic,
         state.selected_speaker,
     )

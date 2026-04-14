@@ -168,6 +168,13 @@ class ConsoleController:
         if self._button is not None:
             self._button.close()
             self._button = None
+        if self._lcd_view is not None:
+            with contextlib.suppress(Exception):
+                self._lcd_view.clear()
+            close_lcd = getattr(self._lcd_view, "close", None)
+            if callable(close_lcd):
+                with contextlib.suppress(Exception):
+                    close_lcd()
 
     async def _await_command(
         self,
