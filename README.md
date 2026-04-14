@@ -4,6 +4,7 @@ This project streams microphone audio to a WebSocket backend and plays server re
 
 It provides:
 - An interactive console UI for device selection and session control
+- A headless daemon mode for Raspberry Pi service startup
 - A single-run script for quick end-to-end checks
 - A local echo WebSocket server for development and testing
 
@@ -84,6 +85,11 @@ In another terminal, start the console:
 python src/console_main.py
 ```
 
+For a background service that listens to the GPIO button and updates the LCD:
+```bash
+python src/service_main.py
+```
+
 Console keys:
 - `1` previous tab
 - `3` next tab
@@ -120,6 +126,7 @@ pre-commit install
 - `src/tests/` - integration helpers, local server, and automated tests
 
 Entry points:
+- `src/service_main.py` - headless daemon mode for GPIO button + LCD
 - `src/console_main.py` - interactive console mode
 - `src/main.py` - single session mode
 

@@ -23,4 +23,4 @@ RUN python -m pip install --upgrade pip \
 
 COPY . .
 
-CMD ["python", "src/console_main.py"]
+CMD ["python", "src/service_main.py"]

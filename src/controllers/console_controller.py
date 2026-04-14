@@ -80,15 +80,7 @@ class ConsoleController:
 
     async def run(self) -> None:
         running = True
-        loop = asyncio.get_running_loop()
-        if self._lcd_view is not None and self._lcd_task is None:
-            self._lcd_task = loop.create_task(self._lcd_heartbeat())
-        if (
-            self._button is not None
-            and self._button.is_enabled
-            and self._button_task is None
-        ):
-            self._button_task = loop.create_task(self._button_listener())
+        loop = self._start_background_tasks()
         try:
             while running:
                 state = self._render_state()
@@ -101,22 +93,40 @@ class ConsoleController:
         except KeyboardInterrupt:
             self._message = "Interrupted, shutting down."
         finally:
-            if self._runner.is_running():
-                await self._runner.stop()
-            self._update_lcd_state(force=True)
-            if self._lcd_task is not None:
-                self._lcd_task.cancel()
-                with contextlib.suppress(asyncio.CancelledError):
-                    await self._lcd_task
-                self._lcd_task = None
-            if self._button_task is not None:
-                self._button_task.cancel()
-                with contextlib.suppress(asyncio.CancelledError):
-                    await self._button_task
-                self._button_task = None
-            if self._button is not None:
-                self._button.close()
-                self._button = None
+            await self._shutdown()
+
+    async def run_service(
+        self,
+        *,
+        stop_event: Optional[asyncio.Event] = None,
+        poll_interval: float = 0.25,
+    ) -> None:
+        self._start_background_tasks()
+        poll_interval = max(0.05, float(poll_interval))
+        last_state = self._build_state()
+        self._view.render(last_state)
+        self._update_lcd_state(force=True)
+        try:
+            while True:
+                if stop_event is not None and stop_event.is_set():
+                    break
+                state = self.get_state()
+                if state != last_state:
+                    self._view.render(state)
+                    self._update_lcd_state()
+                    last_state = state
+                if stop_event is None:
+                    await asyncio.sleep(poll_interval)
+                    continue
+                try:
+                    await asyncio.wait_for(stop_event.wait(), timeout=poll_interval)
+                except asyncio.TimeoutError:
+                    continue
+                break
+        except KeyboardInterrupt:
+            self._message = "Interrupted, shutting down."
+        finally:
+            await self._shutdown()
 
     def get_state(self) -> ConsoleState:
         self._maybe_refresh_devices()
@@ -128,6 +138,36 @@ class ConsoleController:
         self._view.render(state)
         self._update_lcd_state()
         return state
+
+    def _start_background_tasks(self) -> asyncio.AbstractEventLoop:
+        loop = asyncio.get_running_loop()
+        if self._lcd_view is not None and self._lcd_task is None:
+            self._lcd_task = loop.create_task(self._lcd_heartbeat())
+        if (
+            self._button is not None
+            and self._button.is_enabled
+            and self._button_task is None
+        ):
+            self._button_task = loop.create_task(self._button_listener())
+        return loop
+
+    async def _shutdown(self) -> None:
+        if self._runner.is_running():
+            await self._runner.stop()
+        self._update_lcd_state(force=True)
+        if self._lcd_task is not None:
+            self._lcd_task.cancel()
+            with contextlib.suppress(asyncio.CancelledError):
+                await self._lcd_task
+            self._lcd_task = None
+        if self._button_task is not None:
+            self._button_task.cancel()
+            with contextlib.suppress(asyncio.CancelledError):
+                await self._button_task
+            self._button_task = None
+        if self._button is not None:
+            self._button.close()
+            self._button = None
 
     async def _await_command(
         self,

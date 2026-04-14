@@ -103,12 +103,41 @@ class BlockingInput:
         return self._queue.get()
 
 
+class FailingInput:
+    def __call__(self, prompt: str) -> str:
+        raise AssertionError("input() should not be used in service mode")
+
+
 class RecordingView:
     def __init__(self):
         self.states = []
 
     def render(self, state):
         self.states.append(state)
+
+
+class FakeServiceButton:
+    def __init__(self):
+        self.is_enabled = True
+        self.closed = False
+        self._presses: "queue.Queue[bool]" = queue.Queue()
+
+    def press(self):
+        self._presses.put(True)
+
+    def wait_for_press(self, timeout=None):
+        try:
+            self._presses.get(timeout=timeout)
+            return True
+        except queue.Empty:
+            return False
+
+    def wait_for_release(self, timeout=None):
+        return True
+
+    def close(self):
+        self.closed = True
+        self.is_enabled = False
 
 
 class StubRegistry(DeviceRegistry):
@@ -329,6 +358,57 @@ async def test_controller_rerenders_after_runner_finishes_while_waiting_for_inpu
     finally:
         blocking_input.push("q")
         await asyncio.wait_for(task, timeout=2.0)
+
+
+@pytest.mark.asyncio
+async def test_service_mode_uses_button_without_console_input(workspace_tmp_path):
+    mic = StubMicrophone()
+    spk = StubSpeaker()
+    registry = StubRegistry()
+    runner = FakeRunner()
+    button = FakeServiceButton()
+    view = RecordingView()
+    controller = ConsoleController(
+        microphone=mic,
+        speaker=spk,
+        registry=registry,
+        session_runner=runner,
+        view=view,
+        button=button,
+        input_provider=FailingInput(),
+        preferences_path=workspace_tmp_path / "prefs.json",
+    )
+    stop_event = asyncio.Event()
+
+    task = asyncio.create_task(
+        controller.run_service(stop_event=stop_event, poll_interval=0.01)
+    )
+    try:
+        await asyncio.sleep(0.05)
+
+        button.press()
+        for _ in range(20):
+            if runner.start_calls == 1:
+                break
+            await asyncio.sleep(0.05)
+
+        assert runner.running is True
+        assert runner.start_calls == 1
+
+        button.press()
+        for _ in range(20):
+            if runner.stop_calls == 1:
+                break
+            await asyncio.sleep(0.05)
+
+        assert runner.running is False
+        assert runner.stop_calls == 1
+        assert any(state.session_state == "recording" for state in view.states)
+    finally:
+        stop_event.set()
+        await asyncio.wait_for(task, timeout=2.0)
+
+    assert button.closed is True
 
 
 def test_lcd_state_uses_idle_result_when_record_state_is_stale(workspace_tmp_path):

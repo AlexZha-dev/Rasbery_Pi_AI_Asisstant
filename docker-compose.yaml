@@ -4,12 +4,10 @@ services:
       context: .
       dockerfile: Dockerfile
     image: raspberrypi-audio-console:latest
-    command: python src/console_main.py
+    command: python src/service_main.py
     environment:
       AUDIO_WS_URL: ${AUDIO_WS_URL:-wss://your-server.example/ws/audio}
       AUDIO_WS_PASSWORD: ${AUDIO_WS_PASSWORD:-}
-    stdin_open: true
-    tty: true
     # Uncomment for host audio devices on Linux/Raspberry Pi:
     # devices:
     #   - /dev/snd:/dev/snd
@@ -28,13 +26,11 @@ services:
       context: .
       dockerfile: Dockerfile
     image: raspberrypi-audio-console:latest
-    command: python src/console_main.py
+    command: python src/service_main.py
     environment:
       AUDIO_WS_URL: ws://127.0.0.1:8765
       AUDIO_WS_PASSWORD: ${AUDIO_WS_PASSWORD:-}
     network_mode: host
-    stdin_open: true
-    tty: true
     depends_on:
       - ws-local
     profiles: ["local"]
