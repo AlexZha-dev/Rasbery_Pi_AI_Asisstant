@@ -56,6 +56,7 @@ class ConsoleController:
         self._lcd_override_state: Optional[str] = None
         self._lcd_override_until: float = 0.0
         self._lcd_last_session_state: Optional[str] = None
+        self._lcd_terminal_state_consumed: Optional[str] = None
         self._lcd_task: Optional[asyncio.Task] = None
         self._button_task: Optional[asyncio.Task] = None
         self._button_action_lock = asyncio.Lock()
@@ -512,6 +513,8 @@ class ConsoleController:
             ):
                 self._lcd_override_state = state
                 self._lcd_override_until = now + 2.0
+        if state in {"answer_ended", "answer_stopped"}:
+            self._lcd_terminal_state_consumed = state
         if force or state != self._lcd_state:
             self._lcd_view.show_state(state)
             self._lcd_state = state
@@ -524,39 +527,51 @@ class ConsoleController:
         recent_activity = self._speaker_recent_activity()
 
         if status.state == "error":
+            self._lcd_terminal_state_consumed = None
             return "error"
 
         if (
             self._record_state == "recording"
             or status.state in {"connecting", "recording"}
         ):
+            self._lcd_terminal_state_consumed = None
             return "recording_active"
 
         speaker_active = pending_audio or recent_activity
         if speaker_active and self._record_state != "recording":
+            self._lcd_terminal_state_consumed = None
             return "answer_playing"
 
         if status.state == "stopping":
+            self._lcd_terminal_state_consumed = None
             return "waiting_for_response"
 
         if self._record_state == "await_close":
+            self._lcd_terminal_state_consumed = None
             if not self._runner.is_running():
                 return "waiting_for_recording"
             return "waiting_for_response"
 
         if status.state == "idle":
-            lowered = (status.message or "").lower()
-            if "completed" in lowered:
-                if self._lcd_last_session_state == "answer_ended":
+            terminal_state = self._resolve_terminal_lcd_state(status.message)
+            if terminal_state is not None:
+                if self._lcd_terminal_state_consumed == terminal_state:
                     return "waiting_for_recording"
-                return "answer_ended"
-            if "stopped" in lowered:
-                if self._lcd_last_session_state == "answer_stopped":
-                    return "waiting_for_recording"
-                return "answer_stopped"
+                return terminal_state
+            self._lcd_terminal_state_consumed = None
             return "waiting_for_recording"
 
+        self._lcd_terminal_state_consumed = None
         return "waiting_for_recording"
+
+    @staticmethod
+    def _resolve_terminal_lcd_state(message: str) -> Optional[str]:
+        lowered = (message or "").lower()
+        if "completed" in lowered:
+            return "answer_ended"
+        if "stopped" in lowered:
+            return "answer_stopped"
+        return None
 
     def _speaker_has_pending_audio(self) -> bool:
         get_pending_frames = getattr(self._speaker, "pending_frames", None)

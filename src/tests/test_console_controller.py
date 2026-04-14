@@ -118,6 +118,18 @@ class RecordingView:
         self.states.append(state)
 
 
+class RecordingLCDView:
+    def __init__(self):
+        self.states = []
+        self.cleared = False
+
+    def show_state(self, state):
+        self.states.append(state)
+
+    def clear(self):
+        self.cleared = True
+
+
 class FakeServiceButton:
     def __init__(self):
         self.is_enabled = True
@@ -536,3 +548,32 @@ def test_lcd_state_respects_pending_frames_when_audio_is_still_draining(
     spk._pending_frames = 256
 
     assert controller._determine_lcd_state() == "answer_playing"
+
+
+def test_lcd_state_does_not_toggle_forever_between_stopped_and_ready(
+    workspace_tmp_path,
+):
+    lcd_view = RecordingLCDView()
+    controller, mic, spk, runner, fake_input, registry = build_controller(
+        workspace_tmp_path
+    )
+    controller._lcd_view = lcd_view
+    controller._lcd_state = None
+    controller._lcd_override_state = None
+    controller._lcd_override_until = 0.0
+    controller._lcd_terminal_state_consumed = None
+    controller._lcd_last_session_state = None
+    controller._record_state = "ready"
+    runner.running = False
+    runner._status = RunnerStatus("idle", "Session stopped")
+
+    controller._update_lcd_state(force=True)
+    assert lcd_view.states[-1] == "answer_stopped"
+
+    controller._lcd_override_until = time.monotonic() - 1.0
+    controller._update_lcd_state()
+    assert lcd_view.states[-1] == "waiting_for_recording"
+
+    controller._update_lcd_state()
+    assert lcd_view.states[-1] == "waiting_for_recording"
+    assert lcd_view.states == ["answer_stopped", "waiting_for_recording"]
