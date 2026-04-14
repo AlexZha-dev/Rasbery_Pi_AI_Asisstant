@@ -58,7 +58,6 @@ class ConsoleController:
         self._lcd_last_session_state: Optional[str] = None
         self._lcd_task: Optional[asyncio.Task] = None
         self._button_task: Optional[asyncio.Task] = None
-        self._playback_seen: bool = False
         self._button_action_lock = asyncio.Lock()
         self._input = input_provider
         self._prefs_path = preferences_path
@@ -200,7 +199,6 @@ class ConsoleController:
         if success:
             self._record_state = "recording"
             self._message = msg
-            self._playback_seen = False
             self._queue_lcd_state("recording_active", hold_for=1.0)
         else:
             self._record_state = "ready"
@@ -410,7 +408,6 @@ class ConsoleController:
             and not self._runner.is_running()
         ):
             self._record_state = "ready"
-            self._playback_seen = False
 
     def _record_action_label(self) -> str:
         if self._record_state == "ready":
@@ -466,11 +463,10 @@ class ConsoleController:
         self._lcd_last_session_state = state
 
     def _determine_lcd_state(self) -> str:
+        self._sync_record_state()
         status = self._runner.get_status()
-        pending_blocks = self._pending_speaker_blocks()
+        pending_audio = self._speaker_has_pending_audio()
         recent_activity = self._speaker_recent_activity()
-        if pending_blocks > 0 or recent_activity:
-            self._playback_seen = True
 
         if status.state == "error":
             return "error"
@@ -481,15 +477,7 @@ class ConsoleController:
         ):
             return "recording_active"
 
-        speaker_active = (
-            pending_blocks > 0
-            or recent_activity
-            or (
-                self._playback_seen
-                and (self._runner.is_running() or status.state == "stopping")
-                and self._speaker_is_output_running()
-            )
-        )
+        speaker_active = pending_audio or recent_activity
         if speaker_active and self._record_state != "recording":
             return "answer_playing"
 
@@ -504,28 +492,33 @@ class ConsoleController:
         if status.state == "idle":
             lowered = (status.message or "").lower()
             if "completed" in lowered:
-                self._playback_seen = False
                 if self._lcd_last_session_state == "answer_ended":
                     return "waiting_for_recording"
                 return "answer_ended"
             if "stopped" in lowered:
-                self._playback_seen = False
                 if self._lcd_last_session_state == "answer_stopped":
                     return "waiting_for_recording"
                 return "answer_stopped"
-            self._playback_seen = False
             return "waiting_for_recording"
 
         return "waiting_for_recording"
 
-    def _pending_speaker_blocks(self) -> int:
+    def _speaker_has_pending_audio(self) -> bool:
+        get_pending_frames = getattr(self._speaker, "pending_frames", None)
+        if callable(get_pending_frames):
+            try:
+                if int(get_pending_frames()) > 0:
+                    return True
+            except Exception:
+                pass
+
         get_pending = getattr(self._speaker, "pending_blocks", None)
-        if not callable(get_pending):
-            return 0
-        try:
-            return int(get_pending())
-        except Exception:
-            return 0
+        if callable(get_pending):
+            try:
+                return int(get_pending()) > 0
+            except Exception:
+                return False
+        return False
 
     async def _button_listener(self) -> None:
         button = self._button
@@ -558,20 +551,6 @@ class ConsoleController:
                 return False
         except Exception:
             return False
-
-    def _speaker_is_output_running(self) -> bool:
-        is_playing = getattr(self._speaker, "is_playing", None)
-        if callable(is_playing):
-            try:
-                return bool(is_playing())
-            except TypeError:
-                pass
-            except Exception:
-                return False
-        if isinstance(is_playing, bool):
-            return is_playing
-        attr = getattr(self._speaker, "is_playing", False)
-        return bool(attr)
 
     async def _lcd_heartbeat(self) -> None:
         try:

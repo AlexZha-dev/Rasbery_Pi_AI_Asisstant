@@ -27,6 +27,9 @@ class StubSpeaker:
     def __init__(self):
         self.device = None
         self._is_playing = False
+        self._pending_blocks = 0
+        self._pending_frames = 0
+        self._recent_activity = False
 
     def set_output_device(self, index: int):
         self.device = index
@@ -34,6 +37,15 @@ class StubSpeaker:
     @property
     def is_playing(self):
         return self._is_playing
+
+    def pending_blocks(self):
+        return self._pending_blocks
+
+    def pending_frames(self):
+        return self._pending_frames
+
+    def had_recent_activity(self, window: float = 0.75):
+        return self._recent_activity
 
 
 class FakeRunner:
@@ -317,3 +329,45 @@ async def test_controller_rerenders_after_runner_finishes_while_waiting_for_inpu
     finally:
         blocking_input.push("q")
         await asyncio.wait_for(task, timeout=2.0)
+
+
+def test_lcd_state_uses_idle_result_when_record_state_is_stale(workspace_tmp_path):
+    controller, mic, spk, runner, fake_input, registry = build_controller(
+        workspace_tmp_path
+    )
+    controller._record_state = "await_close"
+    runner.running = False
+    runner._status = RunnerStatus("idle", "Session stopped")
+
+    assert controller._determine_lcd_state() == "answer_stopped"
+
+
+def test_lcd_state_does_not_treat_open_output_stream_as_active_playback(
+    workspace_tmp_path,
+):
+    controller, mic, spk, runner, fake_input, registry = build_controller(
+        workspace_tmp_path
+    )
+    controller._record_state = "await_close"
+    runner.running = True
+    runner._status = RunnerStatus("stopping", "Stopping session...")
+    spk._is_playing = True
+    spk._pending_blocks = 0
+    spk._pending_frames = 0
+    spk._recent_activity = False
+
+    assert controller._determine_lcd_state() == "waiting_for_response"
+
+
+def test_lcd_state_respects_pending_frames_when_audio_is_still_draining(
+    workspace_tmp_path,
+):
+    controller, mic, spk, runner, fake_input, registry = build_controller(
+        workspace_tmp_path
+    )
+    controller._record_state = "ready"
+    runner.running = False
+    runner._status = RunnerStatus("idle", "Session stopped")
+    spk._pending_frames = 256
+
+    assert controller._determine_lcd_state() == "answer_playing"
